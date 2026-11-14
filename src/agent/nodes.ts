@@ -308,7 +308,7 @@ GUIDELINES:
     ...state.messages,
   ];
 
-  let response = await modelWithTools.invoke(conversationMessages);
+  let response: AIMessage = await modelWithTools.invoke(conversationMessages);
   let uiAction: Record<string, any> | null = null;
 
   let iterations = 0;
