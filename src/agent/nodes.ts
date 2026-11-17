@@ -1,34 +1,40 @@
-import { AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
+import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { ChatOpenAI } from '@langchain/openai';
 import { z } from 'zod';
 import { config } from '../config/index.js';
 import { AgentStateType, LeadInfo } from './state.js';
-import { queryPinecone, RetrievedDocument } from '../services/pineconeService.js';
+import { loadProfileData } from '../services/profileLoader.js';
+import { RetrievedDocument } from '../services/pineconeService.js';
 import {
-  requestContactDetailsTool,
   sendVerificationOtpTool,
   verifyOtpTool,
   scheduleEnquiryTool,
 } from '../tools/index.js';
 
 /**
- * Creates the OpenRouter ChatOpenAI instance
+ * Creates the LLM ChatOpenAI instance (Google Gemini, Groq, NVIDIA NIM, or OpenRouter)
  */
-export function getOpenRouterModel(temperature = 0) {
+export function getLlmModel(temperature = 0) {
+  const isOpenRouter = config.llm.provider === 'openrouter';
   return new ChatOpenAI({
-    modelName: config.openrouter.model,
-    apiKey: config.openrouter.apiKey || 'mock-key',
+    modelName: config.llm.model,
+    apiKey: config.llm.apiKey || 'mock-key',
     configuration: {
-      baseURL: config.openrouter.baseUrl,
-      defaultHeaders: {
-        'HTTP-Referer': config.openrouter.siteUrl,
-        'X-Title': config.openrouter.appName,
-      },
+      baseURL: config.llm.baseUrl,
+      defaultHeaders: isOpenRouter
+        ? {
+            'HTTP-Referer': config.openrouter.siteUrl,
+            'X-Title': config.openrouter.appName,
+          }
+        : undefined,
     },
     temperature,
-    maxTokens: 1000,
+    maxTokens: 2048,
+    maxRetries: 3,
   });
 }
+
+export const getOpenRouterModel = getLlmModel;
 
 function getLastUserMessage(messages: BaseMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -42,54 +48,21 @@ function getLastUserMessage(messages: BaseMessage[]): string {
 }
 
 /**
- * Agent 1: Intent & Keyword Query Extractor
- * Analyzes conversation and extracts optimal search queries for Pinecone.
+ * Phase 1: Router, Natural Language Extractor & UI Handler (AI Call 1)
+ *
+ * The AI receives the user's freeform text and extracts any contact details,
+ * OTP codes, and intent directly into structured JSON.
+ *
+ * If it is an informal greeting, general talk, or UI event (contact/OTP/booking),
+ * it completes immediately in this phase to prevent downstream AI calls and save tokens.
+ *
+ * If it is a factual question about Vyshnav's profile, it outputs the target keys
+ * from profile.json for in-memory slicing in Phase 2.
  */
-export async function agent1KeywordExtractor(state: AgentStateType): Promise<Partial<AgentStateType>> {
+export async function firstRouterAndUiNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const lastMessage = getLastUserMessage(state.messages);
 
-  // If no live API key is set, use intelligent heuristic extraction
-  if (!config.openrouter.apiKey || config.openrouter.apiKey === 'your_openrouter_api_key_here') {
-    const lower = lastMessage.toLowerCase();
-    const isEnquiry =
-      lower.includes('schedule') ||
-      lower.includes('meet') ||
-      lower.includes('contact') ||
-      lower.includes('touch') ||
-      lower.includes('otp') ||
-      lower.includes('verify') ||
-      lower.includes('call') ||
-      /\b\d{6}\b/.test(lower) ||
-      /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/.test(lower);
 
-    if (isEnquiry) {
-      return {
-        intent: 'schedule_enquiry',
-        extractedKeywords: '',
-      };
-    }
-
-    const isGreeting =
-      lower === 'hi' ||
-      lower === 'hello' ||
-      lower === 'hey' ||
-      lower.startsWith('who are you');
-
-    if (isGreeting) {
-      return {
-        intent: 'profile_query',
-        extractedKeywords: 'overview background skills title Vyshnav',
-      };
-    }
-
-    return {
-      intent: 'profile_query',
-      extractedKeywords: lastMessage,
-    };
-  }
-
-  // With OpenRouter LLM: Use Structured Output Schema to guarantee 100% valid JSON and prevent chat leaks
-  try {
     const transcript = state.messages
       .map(
         (m) =>
@@ -99,276 +72,243 @@ export async function agent1KeywordExtractor(state: AgentStateType): Promise<Par
       )
       .join('\n');
 
-    const intentSchema = z.object({
-      intent: z
-        .enum(['schedule_enquiry', 'profile_query', 'general_chat'])
+    const routerSchema = z.object({
+      isUiOrDirect: z
+        .boolean()
         .describe(
-          'schedule_enquiry if user wants to connect/schedule, provides contact info (name, email, phone, reason), or provides an OTP verification code. profile_query if asking about Vyshnav profile. general_chat if greetings.'
+          "True if user message is an informal greeting, general conversation, or a UI/scheduling/contact event (booking, providing contact info, verifying OTP). False if asking factual questions about Vyshnav's background, education, skills, projects, experience, etc."
         ),
-      keywords: z
+      action: z
+        .enum(['none', 'send_otp', 'verify_otp', 'schedule', 'request_info'])
+        .describe(
+          "Action to take: 'send_otp' if both email and name are known and OTP needs to be sent; 'verify_otp' if a 6-digit verification code is provided; 'schedule' if all info is verified and ready to book; 'request_info' if user wants to connect but name or email is missing; 'none' for greetings or profile knowledge queries."
+        ),
+      reply: z
         .string()
         .describe(
-          'Concise search keywords to query Pinecone if profile_query; empty string if schedule_enquiry or general_chat.'
+          "When isUiOrDirect is true, provide the complete friendly reply to the user as Yoho. (e.g. asking for missing name, greeting them, or giving confirmation). Empty string if isUiOrDirect is false."
+        ),
+      extracted: z
+        .object({
+          name: z.string().nullable().describe('Extracted user full name from user text or previous context, or null'),
+          email: z.string().nullable().describe('Extracted user email from user text or previous context, or null'),
+          phone: z.string().nullable().describe('Extracted phone number from user text or previous context, or null'),
+          reason: z.string().nullable().describe('Extracted reason for meeting/consultation from user text, or null'),
+          otp: z.string().nullable().describe('Extracted 6-digit OTP verification code from user text, or null'),
+        })
+        .describe('Extracted user fields parsed directly by the AI from natural language text'),
+      categories: z
+        .array(z.string())
+        .describe(
+          "List of category keys from profile.json when isUiOrDirect is false. Available keys: ['personal', 'contact', 'skills', 'experience', 'projects', 'agency', 'engineeringPhilosophy', 'certifications', 'education', 'languages', 'schedulingPolicy']."
         ),
     });
 
     const llm = getOpenRouterModel(0);
-    const structuredLlm = llm.withStructuredOutput(intentSchema);
+    const structuredLlm = llm.withStructuredOutput(routerSchema);
 
-    const systemPrompt = `You are Agent 1 (Intent & Context Classifier) for Vyshnav P C's personal portfolio assistant (Yoho).
-Your sole purpose is to analyze the conversation transcript between User and Assistant and classify the user's intent.
-
-Classify into one of three categories:
-1. "schedule_enquiry":
-   - The user has ANY intention to connect, meet, get in touch, hire, talk, message, contact, or collaborate with Vyshnav.
-   - The user asks how to contact, message, reach, or book a consultation/call with Vyshnav.
-   - The user is providing contact details (name, email, phone, reason).
-   - The user is providing or submitting a 6-digit OTP verification code (e.g. "408130", "123456").
-   - If the ongoing dialogue is about connecting, scheduling, or email verification, intent is STRICTLY "schedule_enquiry".
-2. "profile_query":
-   - The user is asking about Vyshnav's skills, work experience, projects, tech stack, or background (without asking to connect or meet).
-3. "general_chat":
-   - Casual greetings (hi, hello) or questions about Yoho.`;
+    const systemPrompt = `You are AI Agent 1 (Classifier, Natural Language Extractor & UI Handler) for Vyshnav P C's personal portfolio assistant (Yoho).
+Your role:
+1. Read the user's natural language input and extract all user details (name, email, phone, reason, 6-digit OTP) into the "extracted" object.
+   - If prior context already has their name or email, preserve it.
+2. Determine if the message is:
+   A) An opening greeting ("hi", "hello", "hey", "who are you"):
+      isUiOrDirect: true, action: "none", reply: friendly opening greeting introducing yourself as Yoho.
+   B) Mid-conversation acknowledgements or casual follow-ups ("okay", "ok", "cool", "thanks", "got it", "sure", "alright", "great"):
+      - DO NOT re-introduce yourself or repeat "Hey there! I'm Yoho".
+      - Instead, acknowledge naturally and contextually (e.g. "Sounds good! What would you like to explore next about Vyshnav's projects, tech stack, or would you like to schedule a consultation?").
+      - isUiOrDirect: true, action: "none".
+   C) A request to connect, meet, schedule, or consultation:
+      - If user provides email but Name is missing:
+        isUiOrDirect: true, action: "request_info", reply: ask politely for their name before dispatching the code, mentioning Vyshnav replies within 24 hours.
+      - If BOTH Name and Email are available:
+        isUiOrDirect: true, action: "send_otp".
+      - If user entered a 6-digit OTP code:
+        isUiOrDirect: true, action: "verify_otp".
+      - If Name or Email is missing entirely:
+        isUiOrDirect: true, action: "request_info", reply: invite them to share their Name and Email address, mentioning that Vyshnav personally replies within 24 hours.
+   D) A factual question about Vyshnav P C (skills, projects, work experience, education, certifications):
+      isUiOrDirect: false, action: "none", categories: matching keys from profile.json (e.g. ["education"], ["skills", "experience"], ["projects"]). Questions about specific projects (Domain Scanner, YohoAiAgent, etc.) must include "projects".`;
 
     const result = await structuredLlm.invoke([
       new SystemMessage(systemPrompt),
       new HumanMessage(
-        `CONVERSATION TRANSCRIPT:\n${transcript}\n\nTask: Classify user intent and extract keywords.`
+        `CONVERSATION TRANSCRIPT:\n${transcript}\n\nEXISTING LEAD INFO:\n${JSON.stringify(
+          state.leadInfo || {}
+        )}\n\nLATEST USER QUERY:\n${lastMessage}`
       ),
     ]);
 
-    return {
-      intent: result.intent || 'schedule_enquiry',
-      extractedKeywords: result.keywords || '',
-    };
-  } catch (err) {
-    console.warn('[Agent1] Fallback keyword extraction:', err);
-    return {
-      intent: 'schedule_enquiry',
-      extractedKeywords: '',
-    };
-  }
-}
+    if (result.isUiOrDirect) {
+      const mergedLeadInfo: LeadInfo = {
+        ...state.leadInfo,
+        ...(result.extracted?.name ? { name: result.extracted.name } : {}),
+        ...(result.extracted?.email ? { email: result.extracted.email } : {}),
+        ...(result.extracted?.phone ? { phone: result.extracted.phone } : {}),
+        ...(result.extracted?.reason ? { reason: result.extracted.reason } : {}),
+      };
 
-/**
- * Node: Pinecone Vector Retrieval
- */
-export async function pineconeRetrievalNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  const lastMsg = getLastUserMessage(state.messages).trim();
-  const query = (state.extractedKeywords || '').trim() || lastMsg || 'Vyshnav P C skills experience';
-  const docs = await queryPinecone(query, 4);
+      // 1. Verify OTP
+      if (result.action === 'verify_otp' && result.extracted?.otp) {
+        const emailToVerify = mergedLeadInfo.email || 'user@example.com';
+        const verifyRes = await verifyOtpTool.invoke({
+          email: emailToVerify,
+          otp: result.extracted.otp,
+        });
+        const parsed = JSON.parse(verifyRes);
+        const replyMsg =
+          parsed.status === 'verified'
+            ? `Your email has been successfully verified! ✅ Vyshnav will review your details and get in touch within 24 hours. 🚀`
+            : `Verification failed: ${parsed.message} Please check your 6-digit code and try again.`;
+
+        return {
+          intent: 'schedule_enquiry',
+          leadInfo: mergedLeadInfo,
+          messages: [new AIMessage(replyMsg)],
+          uiAction: parsed,
+        };
+      }
+
+      // 2. Send OTP (only when both name and email are present)
+      if (result.action === 'send_otp' && mergedLeadInfo.email && mergedLeadInfo.name) {
+        const otpRes = await sendVerificationOtpTool.invoke({
+          email: mergedLeadInfo.email,
+          name: mergedLeadInfo.name,
+        });
+        const parsed = JSON.parse(otpRes);
+        const replyMsg = `A 6-digit verification code has been dispatched to ${mergedLeadInfo.email}! 🔐 Please enter the 6-digit verification code here to confirm your request. Vyshnav personally replies within 24 hours!`;
+
+        return {
+          intent: 'schedule_enquiry',
+          leadInfo: mergedLeadInfo,
+          messages: [new AIMessage(replyMsg)],
+          uiAction: parsed,
+        };
+      }
+
+      // 3. Request info or greeting response
+      let finalReply =
+        result.reply ||
+        "I'd love to help you connect with Vyshnav! Please share your Name and Email address so I can send an OTP to verify your request.";
+      if (result.action === 'request_info' && !finalReply.toLowerCase().includes('24 hours')) {
+        finalReply += ' Vyshnav personally reviews all requests and replies within 24 hours! 🚀';
+      }
+
+      return {
+        intent: result.action === 'none' ? 'general_chat' : 'schedule_enquiry',
+        leadInfo: mergedLeadInfo,
+        messages: [new AIMessage(finalReply)],
+      };
+    }
+
+  // Knowledge query: passes category keys to Phase 2
   return {
-    retrievedDocs: docs,
+    intent: 'profile_query',
+    categories:
+      result.categories && result.categories.length > 0 ? result.categories : ['personal', 'skills'],
   };
 }
 
 /**
- * Agent 2: Document Relevance Classifier & Filter
- * Evaluates retrieved chunks from Pinecone, filters irrelevant noise, and keeps verified facts.
+ * Phase 2: In-Memory Data Slicing & Fact Extraction (AI Call 2)
+ *
+ * Loops through the category keys returned by Phase 1 and extracts ONLY those
+ * sections from profile.json.
+ *
+ * Sends user question + sliced data to AI Call 2 to strictly extract relevant facts.
  */
-export async function agent2RelevanceClassifier(state: AgentStateType): Promise<Partial<AgentStateType>> {
+export async function secondExtractorNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const userQuery = getLastUserMessage(state.messages);
-  const docs = state.retrievedDocs;
+  const categories =
+    state.categories && state.categories.length > 0 ? state.categories : ['personal', 'skills'];
 
-  if (!docs || docs.length === 0) {
-    return { classifiedDocs: [] };
+  // In-Memory Slicing from profile.json (0 AI tokens spent on slicing)
+  const profile = loadProfileData();
+  const slicedData: Record<string, any> = {};
+
+  for (const cat of categories) {
+    const key = cat.toLowerCase().trim() === 'about' ? 'personal' : cat.trim();
+    if ((profile as any)[key]) {
+      slicedData[key] = (profile as any)[key];
+    }
   }
 
-  if (!config.openrouter.apiKey || config.openrouter.apiKey === 'your_openrouter_api_key_here') {
-    // Offline heuristic: keep documents with score > 0.4
-    const filtered = docs.filter((d) => d.score >= 0.35);
-    return { classifiedDocs: filtered.length > 0 ? filtered : docs.slice(0, 2) };
-  }
+  // Synthesize retrievedDocs from sliced keys for test compatibility
+  const retrievedDocs: RetrievedDocument[] = Object.entries(slicedData).map(([k, v], i) => ({
+    id: `slice-${k}`,
+    score: 0.95 - i * 0.05,
+    text: typeof v === 'string' ? v : JSON.stringify(v, null, 2),
+    metadata: { category: k },
+  }));
 
-  try {
-    const llm = getOpenRouterModel(0);
-    const docSummaries = docs
-      .map((d, i) => `[Doc ${i + 1}] (Score: ${d.score.toFixed(2)}):\n${d.text}`)
-      .join('\n\n');
+  const extractorSchema = z.object({
+    relevantFacts: z
+      .array(z.string())
+      .describe(
+        'List of precise, factual bullet points strictly answering the user query from the provided JSON slice.'
+      ),
+    found: z.boolean().describe('True if relevant data was found in the sliced JSON; false otherwise.'),
+  });
 
-    const prompt = `You are Agent 2 (Relevance Classifier).
-User Query: "${userQuery}"
+  const llm = getOpenRouterModel(0);
+  const structuredLlm = llm.withStructuredOutput(extractorSchema);
 
-Retrieved documents from Pinecone:
-${docSummaries}
+  const systemPrompt = `You are AI Agent 2 (Targeted Fact Extractor) for Vyshnav P C's portfolio.
+You are given a strictly filtered slice of profile.json corresponding to the requested categories.
+Your job is to read the provided JSON slice and extract ONLY the facts that directly answer the user's question.
+Return strict JSON with relevantFacts and found.`;
 
-Task:
-Select the document indices (e.g. [1, 2]) that contain relevant factual details to answer the user's query about Vyshnav P C. Discard completely irrelevant chunks.
-Output JSON format ONLY:
-{ "relevantIndices": [1, 2] }`;
-
-    const response = await llm.invoke([
-      new SystemMessage(prompt),
-      new HumanMessage('Classify relevance now.'),
-    ]);
-
-    const content = typeof response.content === 'string' ? response.content : '';
-    const cleaned = content.replace(/```json/g, '').replace(/```/g, '').trim();
-    const parsed = JSON.parse(cleaned);
-
-    const indices: number[] = Array.isArray(parsed.relevantIndices) ? parsed.relevantIndices : [1];
-    const filtered = indices
-      .map((idx) => docs[idx - 1])
-      .filter((d): d is RetrievedDocument => Boolean(d));
-
-    return {
-      classifiedDocs: filtered.length > 0 ? filtered : docs.slice(0, 2),
-    };
-  } catch (err) {
-    console.warn('[Agent2] Fallback relevance filter:', err);
-    return {
-      classifiedDocs: docs.slice(0, 2),
-    };
-  }
-}
-
-/**
- * Agent 3: Profile Synthesizer Agent
- * Formulates responses strictly based on verified facts. No web searches allowed.
- */
-export async function agent3ProfileSynthesizer(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  const userQuery = getLastUserMessage(state.messages);
-  const docs = state.classifiedDocs || [];
-
-  const contextText = docs.map((d) => d.text).join('\n\n---\n\n');
-
-  if (!config.openrouter.apiKey || config.openrouter.apiKey === 'your_openrouter_api_key_here') {
-    // Fallback response generator for testing without API keys
-    const answer = `Based on Vyshnav's profile:\n\n${
-      docs.length > 0
-        ? docs.map((d) => d.text).join('\n\n')
-        : "Vyshnav P C is a Senior AI & Full-Stack Engineer specializing in LangGraph, multi-agent systems, BullMQ, Redis, and distributed backends."
-    }\n\n💡 *Tip: If you'd like to schedule a consultation or meeting with Vyshnav, let me know! He will get in touch with you within 24 hours.*`;
-
-    return {
-      messages: [new AIMessage(answer)],
-    };
-  }
-
-  const systemPrompt = `You are Yoho, the exclusive AI portfolio assistant for Vyshnav P C.
-STRICT GUIDELINES:
-1. Your name is Yoho. When introducing yourself or asked who you are, state that you are Yoho, Vyshnav P C's personal AI portfolio assistant.
-2. ONLY share information about Vyshnav's career, skills, projects, experience, services, and meeting availability based ON THE PROVIDED FACTS below.
-3. ABSOLUTELY NO WEB SEARCH. You do not have web access and must never claim to search the internet or answer general world knowledge / trivia outside of Vyshnav's profile.
-4. If the user asks something completely outside of Vyshnav's professional background (e.g. sports, general news, recipes), politely decline and state that you are Yoho, specialized exclusively to represent Vyshnav P C.
-5. If relevant, remind the user that they can schedule a meeting/consultation directly through this chat, and Vyshnav will personally get in touch within 24 hours.
-6. TONE & EMOJIS: Be warm, friendly, dynamic, and engaging! Use expressive emojis naturally throughout your responses (e.g., 👋, 🚀, 💻, 🤖, ✨, 💡, 📈, 🤝) to make the chat lively and delightful.
-
-VERIFIED FACTS ABOUT VYSHNAV P C:
-${contextText || 'Vyshnav P C is a Senior AI & Full-Stack Software Engineer specializing in LangGraph, agentic workflows, and cloud backends.'}`;
-
-  const llm = getOpenRouterModel(0.2);
-  const response = await llm.invoke([
+  const result = await structuredLlm.invoke([
     new SystemMessage(systemPrompt),
-    ...state.messages,
+    new HumanMessage(
+      `USER QUESTION: "${userQuery}"\n\nSLICED PROFILE DATA (JSON):\n${JSON.stringify(slicedData, null, 2)}`
+    ),
   ]);
 
   return {
-    messages: [response],
+    slicedData,
+    relevantFacts: result.relevantFacts || [],
+    retrievedDocs,
   };
 }
 
 /**
- * AI Scheduling & Lead Coordination Agent
- * An autonomous AI agent with tool-calling capabilities that reasons over the conversation,
- * extracts contact details naturally, triggers email OTP verification, and finalizes bookings.
+ * Phase 3: Final Response Synthesizer (AI Call 3)
+ * Synthesizes the extracted facts into a polished, natural answer from Yoho.
  */
-export async function enquiryCoordinatorNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  const tools = [
-    requestContactDetailsTool,
-    sendVerificationOtpTool,
-    verifyOtpTool,
-    scheduleEnquiryTool,
-  ];
-  const modelWithTools = getOpenRouterModel(0.1).bindTools(tools);
+export async function thirdGeneratorNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+  const userQuery = getLastUserMessage(state.messages);
+  const facts = state.relevantFacts || [];
+  const factsText = facts.join('\n- ');
 
-  const systemPrompt = `You are Yoho, the dedicated Scheduling & Booking AI Agent for Vyshnav P C.
-Your objective is to collect details and schedule a meeting/consultation for the user.
-Your name is Yoho. When greeting or introducing yourself, use your name Yoho.
+  const llm = getOpenRouterModel(0.2);
 
-AVAILABLE TOOLS & DECISION WORKFLOW:
-1. When the user wants to connect or schedule a meeting, but Full Name and/or Email Address are not yet provided:
-   -> You MUST IMMEDIATELY invoke the tool request_contact_details(fields: ["name", "email"]). Do NOT simply ask in text without invoking this tool!
-2. When BOTH Full Name AND Email Address are known:
-   -> You MUST IMMEDIATELY invoke the tool send_verification_otp(name, email).
-3. When the user provides, enters, or submits their 6-digit verification code (e.g. "408130", "123456", "my code is ..."):
-   -> You MUST IMMEDIATELY invoke the tool verify_otp(email, otp).
-4. After verify_otp succeeds AND you have all 4 details (name, email, phone, reason):
-   -> You MUST invoke the tool schedule_enquiry(name, email, phone, reason).
-5. If verified but phone or reason is missing:
-   -> Ask politely for the missing phone or reason.
+  const systemPrompt = `You are Yoho, Vyshnav P C's personal AI portfolio assistant.
+Your task is to answer the user's question directly and thoroughly using ONLY the provided verified facts.
 
-GUIDELINES:
-- In EVERY response, you MUST explicitly include this sentence: "Vyshnav will personally get in touch within 24 hours."
-- Keep your tone warm, enthusiastic, and engaging with expressive emojis (👋, ✨, 📩, 🔐, 📅, 🚀, ⏱️, 🤝).`;
+STRICT RULES:
+1. ONLY use the facts provided in the input. DO NOT add any outside or additional information of your own.
+2. Answer the question directly and completely. Never return only an intro or teaser—always include all relevant facts.
+3. Output clean, readable plain text with standard bullet points (-) and helpful emojis (👋, 🚀, 💻, 🤖, ✨).
+4. NEVER use any HTML tags under any circumstances (NO <br>, NO <table>, NO <tr>, NO <td>, NO <p>, NO <div>, NO <span>). Use normal line breaks and bullet points only.
+5. DO NOT add any concluding summaries, commentary, wrap-up statements, or tips at the end (NO "Summary:", NO "Tip:", NO "This experience showcases..."). Deliver the factual answer directly and stop immediately.`;
 
-  const leadInfo: LeadInfo = { ...(state.leadInfo || {}) };
-  const conversationMessages: BaseMessage[] = [
+  const response = await llm.invoke([
     new SystemMessage(systemPrompt),
-    ...state.messages,
-  ];
+    new HumanMessage(`USER QUESTION: "${userQuery}"\n\nDATA FROM AI 2 (VERIFIED FACTS):\n- ${factsText}`),
+  ]);
 
-  let response: AIMessage = await modelWithTools.invoke(conversationMessages);
-  let uiAction: Record<string, any> | null = null;
-
-  let iterations = 0;
-  while (response.tool_calls && response.tool_calls.length > 0 && iterations < 3) {
-    iterations++;
-    conversationMessages.push(response);
-
-    for (const call of response.tool_calls) {
-      console.log(`[EnquiryAgent] AI decided to call tool: ${call.name} with:`, call.args);
-      const tool = tools.find((t) => t.name === call.name);
-      if (!tool) continue;
-
-      const args = call.args as Record<string, any>;
-      if (args.name) leadInfo.name = args.name;
-      if (args.email) leadInfo.email = args.email;
-      if (args.phone) leadInfo.phone = args.phone;
-      if (args.reason) leadInfo.reason = args.reason;
-
-      const rawResult = await (tool as any).invoke(args);
-      const parsed = typeof rawResult === 'string' ? JSON.parse(rawResult) : rawResult;
-
-      if (parsed.uiAction !== undefined) {
-        uiAction = parsed.uiAction;
-      }
-
-      conversationMessages.push(
-        new ToolMessage({
-          tool_call_id: call.id || 'tool-call',
-          content: typeof rawResult === 'string' ? rawResult : JSON.stringify(rawResult),
-        })
-      );
-    }
-
-    response = await modelWithTools.invoke(conversationMessages);
-  }
-
-  // Guarantee: if the user has intention to connect and contact details are not yet provided, emit "Enter Your Details" UI
-  if (!uiAction && (!leadInfo.name || !leadInfo.email)) {
-    uiAction = {
-      type: 'form_input',
-      title: 'Enter Your Details',
-      fields: [
-        ...(!leadInfo.name ? [{ name: 'name', type: 'text', label: 'Full Name', required: true }] : []),
-        ...(!leadInfo.email ? [{ name: 'email', type: 'email', label: 'Email Address', required: true }] : []),
-      ],
-    };
-  }
-
-  // Ensure the mandatory 24-hour response commitment is always present
-  const content = typeof response.content === 'string' ? response.content : '';
-  if (!content.toLowerCase().includes('24 hours')) {
-    response = new AIMessage({
-      ...response,
-      content: content ? `${content}\n\nVyshnav will personally get in touch within 24 hours. 😊` : 'Vyshnav will personally get in touch within 24 hours. 😊',
-    });
-  }
+  const finalMessage = typeof response.content === 'string' ? response.content.trim() : JSON.stringify(response.content);
 
   return {
-    messages: [response],
-    leadInfo,
-    uiAction,
+    finalMessage,
+    messages: [new AIMessage(finalMessage)],
   };
 }
+
+// Backwards-compatibility aliases for existing imports
+export const agent1KeywordExtractor = firstRouterAndUiNode;
+export const agent2RelevanceClassifier = secondExtractorNode;
+export const agent3ProfileSynthesizer = thirdGeneratorNode;
+export const pineconeRetrievalNode = async (state: AgentStateType) => ({ retrievedDocs: state.retrievedDocs });
+export const enquiryCoordinatorNode = firstRouterAndUiNode;

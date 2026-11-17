@@ -1,24 +1,17 @@
-import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { config } from '../config/index.js';
 import { getPineconeClient, generateEmbedding } from '../services/pineconeService.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { loadProfileSections, getProfileFilePath } from '../services/profileLoader.js';
 
 export async function ingestProfileData(): Promise<{ success: boolean; count: number; message: string }> {
-  const profilePath = path.resolve(__dirname, '../data/profile.md');
+  const fileInfo = getProfileFilePath();
+  const rawSections = loadProfileSections();
 
-  if (!fs.existsSync(profilePath)) {
-    throw new Error(`Profile file not found at ${profilePath}`);
+  if (rawSections.length === 0) {
+    throw new Error(`No profile sections found in ${fileInfo.path}`);
   }
 
-  const content = fs.readFileSync(profilePath, 'utf-8');
-  // Split into sections by Markdown headers (##)
-  const rawSections = content.split(/\n(?=## )/g).map((s) => s.trim()).filter(Boolean);
-
-  console.log(`[Ingest] Found ${rawSections.length} sections to index.`);
+  console.log(`[Ingest] Loaded ${rawSections.length} sections from ${path.basename(fileInfo.path)} (${fileInfo.format.toUpperCase()}).`);
 
   const pinecone = getPineconeClient();
   if (!pinecone || !config.pinecone.apiKey) {
@@ -26,7 +19,7 @@ export async function ingestProfileData(): Promise<{ success: boolean; count: nu
     return {
       success: true,
       count: rawSections.length,
-      message: `Profile contains ${rawSections.length} sections. (Running with local knowledge base fallback since PINECONE_API_KEY is not configured).`,
+      message: `Profile contains ${rawSections.length} sections from ${path.basename(fileInfo.path)}. (Running with local knowledge base fallback since PINECONE_API_KEY is not configured).`,
     };
   }
 
@@ -59,19 +52,19 @@ export async function ingestProfileData(): Promise<{ success: boolean; count: nu
 
     for (let i = 0; i < rawSections.length; i++) {
       const section = rawSections[i];
-      const titleMatch = section.match(/^##\s+(.*)/m);
-      const title = titleMatch ? titleMatch[1] : `Section ${i + 1}`;
+      const title = section.title || `Section ${i + 1}`;
 
       console.log(`[Ingest] Generating embedding for [${i + 1}/${rawSections.length}]: "${title}"...`);
-      const embedding = await generateEmbedding(section);
+      const embedding = await generateEmbedding(section.text);
 
       vectors.push({
-        id: `profile-chunk-${i + 1}`,
+        id: section.id || `profile-chunk-${i + 1}`,
         values: embedding,
         metadata: {
-          text: section,
+          text: section.text,
           title,
-          source: 'profile.md',
+          source: path.basename(fileInfo.path),
+          ...(section.metadata || {}),
           updatedAt: new Date().toISOString(),
         },
       });
@@ -84,7 +77,7 @@ export async function ingestProfileData(): Promise<{ success: boolean; count: nu
     return {
       success: true,
       count: vectors.length,
-      message: `Successfully indexed ${vectors.length} profile chunks into Pinecone index '${indexName}'.`,
+      message: `Successfully indexed ${vectors.length} profile chunks from ${path.basename(fileInfo.path)} into Pinecone index '${indexName}'.`,
     };
   } catch (error: any) {
     console.error('[Ingest] Ingestion failed:', error);

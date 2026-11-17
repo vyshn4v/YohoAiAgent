@@ -98,6 +98,10 @@ app.get('/api/health', async (_req: Request, res: Response) => {
         configured: pineconeConfigured,
         index: config.pinecone.indexName,
       },
+      langsmith: {
+        configured: Boolean(config.langsmith.apiKey),
+        project: config.langsmith.project,
+      },
     },
     message: 'Backend is active and ready to handle chat & scheduling requests.',
   });
@@ -167,7 +171,7 @@ async function handleSseChatStream(
 
     const stream = agentGraph.streamEvents(
       { messages: updatedHistory, leadInfo: session.leadInfo },
-      { version: 'v2' }
+      { version: 'v2', runName: 'Portfolio Agent Stream' }
     );
 
     for await (const event of stream) {
@@ -177,29 +181,14 @@ async function handleSseChatStream(
 
       // Status updates when nodes start
       if (event.event === 'on_chain_start') {
-        if (node === 'agent1_keyword_extractor') {
+        if (node === 'first_router_and_ui' || node === 'agent1_keyword_extractor') {
           sendEvent('status', { node, status: 'understanding_query' });
-        } else if (node === 'pinecone_retrieval') {
-          sendEvent('status', { node, status: 'searching_knowledge_base' });
-        } else if (node === 'agent2_relevance_classifier') {
-          sendEvent('status', { node, status: 'verifying_relevance' });
-        } else if (node === 'agent3_profile_synthesizer') {
+        } else if (node === 'second_extractor' || node === 'agent2_relevance_classifier') {
+          sendEvent('status', { node, status: 'extracting_facts' });
+        } else if (node === 'third_generator' || node === 'agent3_profile_synthesizer') {
           sendEvent('status', { node, status: 'generating_answer' });
         } else if (node === 'enquiry_coordinator') {
           sendEvent('status', { node, status: 'processing_enquiry' });
-        }
-      }
-
-      // Stream tokens specifically from synthesizer or enquiry coordinator
-      if (
-        event.event === 'on_chat_model_stream' &&
-        (node === 'agent3_profile_synthesizer' || node === 'enquiry_coordinator')
-      ) {
-        const chunk = event.data.chunk?.content;
-        if (typeof chunk === 'string' && chunk.length > 0) {
-          fullReply += chunk;
-          tokensStreamed++;
-          sendEvent('token', { token: chunk, conversationId });
         }
       }
 
@@ -217,20 +206,34 @@ async function handleSseChatStream(
         }
         if (finalState?.messages && finalState.messages.length > 0) {
           const lastMsg = finalState.messages[finalState.messages.length - 1];
-          const text =
+          let text =
             typeof lastMsg.content === 'string'
               ? lastMsg.content
               : JSON.stringify(lastMsg.content);
-          if (!fullReply) {
-            fullReply = text;
+
+          // If text is a structured JSON string, extract the clean conversational reply
+          try {
+            const parsed = JSON.parse(text.trim());
+            if (parsed && typeof parsed === 'object') {
+              if (typeof parsed.reply === 'string') text = parsed.reply;
+              else if (typeof parsed.message === 'string') text = parsed.message;
+            }
+          } catch {
+            // Clean text already
           }
+
+          fullReply = text;
         }
       }
     }
 
-    // If no tokens were streamed (e.g. offline fallback or direct tool response), send full text
-    if (tokensStreamed === 0 && fullReply) {
-      sendEvent('token', { token: fullReply, conversationId });
+    // Stream the clean conversational reply in smooth tokens to client
+    if (fullReply) {
+      const words = fullReply.split(/(\s+)/);
+      for (const word of words) {
+        if (isClientDisconnected) break;
+        sendEvent('token', { token: word, conversationId });
+      }
     }
 
     // Save history and leadInfo
@@ -328,10 +331,21 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
     });
 
     const lastAiMsg = finalState.messages[finalState.messages.length - 1];
-    const replyText =
+    let replyText =
       typeof lastAiMsg.content === 'string'
         ? lastAiMsg.content
         : JSON.stringify(lastAiMsg.content);
+
+    // If replyText is a raw JSON string, extract clean conversational text
+    try {
+      const parsed = JSON.parse(replyText.trim());
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.reply === 'string') replyText = parsed.reply;
+        else if (typeof parsed.message === 'string') replyText = parsed.message;
+      }
+    } catch {
+      // Clean text already
+    }
 
     // Save updated history and leadInfo
     const mergedLeadInfo = { ...session.leadInfo, ...(finalState.leadInfo || {}) };
