@@ -211,6 +211,7 @@ Your role:
         isUiOrDirect: true, action: "request_info", reply: ask politely for their name before dispatching the code, mentioning Vyshnav replies within 24 hours.
       - If BOTH Name and Email are available:
         isUiOrDirect: true, action: "send_otp".
+      - After email verification, collect any missing name, email, phone and reason; use action: "schedule" when these are available.
       - If user entered a 6-digit OTP code:
         isUiOrDirect: true, action: "verify_otp".
       - If Name or Email is missing entirely:
@@ -237,9 +238,20 @@ Your role:
         ...(result.extracted?.reason ? { reason: result.extracted.reason } : {}),
       };
 
+      let isVerified = state.isVerified && mergedLeadInfo.email === state.leadInfo.email;
+
       // 1. Verify OTP
       if (result.action === 'verify_otp' && result.extracted?.otp) {
-        const emailToVerify = mergedLeadInfo.email || 'user@example.com';
+        const emailToVerify = mergedLeadInfo.email;
+        if (!emailToVerify?.trim()) {
+          return {
+            intent: 'schedule_enquiry',
+            leadInfo: mergedLeadInfo,
+            isVerified: false,
+            messages: [new AIMessage('Please share your email address so I can verify your code.')],
+            uiAction: null,
+          };
+        }
         const verifyRes = await verifyOtpTool.invoke({
           email: emailToVerify,
           otp: result.extracted.otp,
@@ -256,71 +268,35 @@ Your role:
           };
         }
 
-        // Email verified successfully - collect any missing details before invoking scheduleEnquiryTool
-        if (!mergedLeadInfo.name) {
-          const replyMsg = `Your email has been successfully verified! ✅ Could you please provide your full name so I can finalize your consultation booking?`;
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            isVerified: true,
-            messages: [new AIMessage(replyMsg)],
-            uiAction: null,
-          };
-        }
-
-        // Invoke scheduleEnquiryTool before ending the graph
-        const scheduleRes = await scheduleEnquiryTool.invoke({
-          name: mergedLeadInfo.name,
-          email: emailToVerify,
-          phone: mergedLeadInfo.phone || 'Not provided',
-          reason: mergedLeadInfo.reason || 'General portfolio consultation / enquiry',
-        });
-        const scheduleParsed = parseToolOutput(scheduleRes);
-
-        if (scheduleParsed.status === 'confirmed') {
-          const replyMsg = `Your email has been successfully verified! ✅ Vyshnav will review your details and get in touch within 24 hours. 🚀`;
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            isVerified: true,
-            messages: [new AIMessage(replyMsg)],
-            uiAction: null,
-          };
-        } else {
-          const replyMsg = `Your email was verified, but we were unable to finalize your consultation: ${scheduleParsed.message || 'Please try again.'}`;
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            isVerified: true,
-            messages: [new AIMessage(replyMsg)],
-            uiAction: null,
-          };
-        }
+        isVerified = true;
       }
 
-      // 2. Schedule action
-      if (result.action === 'schedule') {
-        if (!mergedLeadInfo.name || !mergedLeadInfo.email) {
-          const missing = !mergedLeadInfo.name && !mergedLeadInfo.email ? 'Name and Email address' : !mergedLeadInfo.name ? 'full name' : 'email address';
-          const replyMsg = `To schedule your consultation, please share your ${missing}. Vyshnav personally reviews all requests and replies within 24 hours!`;
+      // Continue collecting details after verification, including on later turns.
+      if (result.action === 'schedule' ||
+          (result.action === 'verify_otp' && isVerified) ||
+          (isVerified && ['send_otp', 'request_info'].includes(result.action))) {
+        const requiredFields = ['name', 'email', 'phone', 'reason'] as const;
+        const missing = requiredFields.filter((field) => !mergedLeadInfo[field]?.trim());
+        if (missing.length > 0) {
           return {
             intent: 'schedule_enquiry',
             leadInfo: mergedLeadInfo,
-            messages: [new AIMessage(replyMsg)],
+            isVerified,
+            messages: [new AIMessage(`To complete your enquiry, please share your ${missing.join(', ')}.`)],
             uiAction: null,
           };
         }
 
         const scheduleRes = await scheduleEnquiryTool.invoke({
-          name: mergedLeadInfo.name,
-          email: mergedLeadInfo.email,
-          phone: mergedLeadInfo.phone || 'Not provided',
-          reason: mergedLeadInfo.reason || 'General portfolio consultation / enquiry',
+          name: mergedLeadInfo.name!,
+          email: mergedLeadInfo.email!,
+          phone: mergedLeadInfo.phone!,
+          reason: mergedLeadInfo.reason!,
         });
         const scheduleParsed = parseToolOutput(scheduleRes);
 
         if (scheduleParsed.status === 'confirmed') {
-          const replyMsg = `Your consultation is confirmed! ✅ Vyshnav will review your details and personally get in touch within 24 hours. 🚀`;
+          const replyMsg = `${result.action === 'verify_otp' ? 'Your email has been successfully verified! ' : ''}Your consultation is confirmed! ✅ Vyshnav will review your details and personally get in touch within 24 hours. 🚀`;
           return {
             intent: 'schedule_enquiry',
             leadInfo: mergedLeadInfo,
@@ -330,8 +306,8 @@ Your role:
           };
         } else if (scheduleParsed.status === 'unverified') {
           const otpRes = await sendVerificationOtpTool.invoke({
-            email: mergedLeadInfo.email,
-            name: mergedLeadInfo.name,
+            email: mergedLeadInfo.email!,
+            name: mergedLeadInfo.name!,
           });
           const otpParsed = parseToolOutput(otpRes);
           const isSent = otpParsed.status === 'sent';
@@ -348,7 +324,8 @@ Your role:
           return {
             intent: 'schedule_enquiry',
             leadInfo: mergedLeadInfo,
-            messages: [new AIMessage(`Could not complete your enquiry: ${scheduleParsed.message}`)],
+            isVerified,
+            messages: [new AIMessage(`Could not complete your enquiry: ${scheduleParsed.message || 'Please try again.'}`)],
             uiAction: null,
           };
         }
