@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { config } from '../config/index.js';
+import { loadProfileSections } from './profileLoader.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -86,22 +87,21 @@ function generateDeterministicVector(text: string, dimension: number): number[] 
 
 /**
  * Reads local profile document chunks as fallback when Pinecone is not yet initialized.
+ * Seamlessly loads from profile.json (or profile.md fallback).
  */
 function getLocalProfileChunks(): RetrievedDocument[] {
   try {
-    const profilePath = path.resolve(__dirname, '../data/profile.md');
-    if (fs.existsSync(profilePath)) {
-      const content = fs.readFileSync(profilePath, 'utf-8');
-      const sections = content.split(/\n(?=## )/g);
+    const sections = loadProfileSections();
+    if (sections.length > 0) {
       return sections.map((sec, idx) => ({
-        id: `chunk-local-${idx}`,
+        id: sec.id || `chunk-local-${idx}`,
         score: 0.95 - idx * 0.05,
-        text: sec.trim(),
-        metadata: { source: 'profile.md', section: idx },
+        text: sec.text.trim(),
+        metadata: { source: 'profile.json', section: idx, title: sec.title, ...(sec.metadata || {}) },
       }));
     }
   } catch (err) {
-    console.warn('[PineconeService] Could not read local profile.md', err);
+    console.warn('[PineconeService] Could not read local profile data', err);
   }
   return [];
 }

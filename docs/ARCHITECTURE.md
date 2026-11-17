@@ -8,10 +8,10 @@ This document provides a comprehensive technical overview of the architecture, d
 
 ## 1. High-Level Architectural Overview
 
-The backend is built as an event-driven, multi-agent AI system on top of **Node.js / TypeScript**, **LangGraph.js**, **OpenRouter (`openai/gpt-4o-mini`)**, **Pinecone Vector Database**, **Redis**, and **BullMQ**.
+The backend is built as an event-driven, multi-agent AI system on top of **Node.js / TypeScript**, **LangGraph.js**, **Google Gemini Flash** (`gemini-flash-lite-latest` via Google AI Studio), **In-Memory Structured Profile Slicing** (`src/data/profile.json`), **Redis**, and **BullMQ**.
 
 It serves two primary roles:
-1. **Portfolio RAG Assistant**: Answers questions strictly grounded in Vyshnav's background, technical stack, featured projects, and career history (with **strictly no web searching**).
+1. **Portfolio Knowledge Assistant**: Answers questions strictly grounded in Vyshnav's background, technical stack, featured projects ([Domain Scanner](https://domainscanner.vyshnavpc.com) and [YohoAiAgent](https://github.com/vyshn4v/YohoAiAgent)), and career history (with **strictly no web searching**, clean plain text, zero HTML tags, and zero unsolicited wrap-ups or tips).
 2. **Consultation & Meeting Booking Engine**: Dynamically collects visitor details, secures bookings via 6-digit cryptographic email OTPs, enforces a **24-hour SLA commitment**, and renders generative interactive UI widgets on the frontend.
 
 ### Component Topology
@@ -28,28 +28,28 @@ flowchart TD
     end
 
     subgraph LangGraphLayer ["LangGraph Agent Graph (src/agent/graph.ts)"]
-        Agent1["Agent 1: Structured Intent & Keyword Extractor"]
+        Node1["Phase 1: firstRouterAndUiNode (AI Call 1)"]
         Router{"Intent Router"}
         
-        subgraph RAGPipeline ["Profile RAG Pipeline"]
-            PineconeNode["Pinecone Retrieval Node"]
-            Agent2["Agent 2: Relevance Classifier"]
-            Agent3["Agent 3: Profile Synthesizer (Yoho Persona)"]
+        subgraph KnowledgePipeline ["Knowledge & Fact Extraction Pipeline"]
+            Slicer["In-Memory Slicer (src/services/profileLoader.ts)"]
+            Node2["Phase 2: secondExtractorNode (AI Call 2)"]
+            Node3["Phase 3: thirdGeneratorNode (AI Call 3)"]
         end
         
-        subgraph EnquiryPipeline ["Enquiry & Booking Pipeline"]
-            Coordinator["Enquiry Coordinator Node (AI Tool-Calling)"]
+        subgraph DirectPipeline ["Direct Chat & Booking Pipeline"]
+            DirectComplete["Immediate Completion (1 AI Call)"]
             Tools["AI Tools (src/tools/index.ts)"]
         end
     end
 
-    subgraph StorageLayer ["Data & Asynchronous Services"]
+    subgraph DataLayer ["Data & Asynchronous Services"]
+        ProfileJSON[("profile.json (Ground Truth)")]
         RedisDB[("Redis (Sessions, OTPs, Bookings)")]
-        PineconeDB[("Pinecone Serverless (Vector Store)")]
         BullQueue["BullMQ Email Queue (src/queues/emailQueue.ts)"]
         Worker["Email Background Worker (src/workers/emailWorker.ts)"]
         SMTP["SMTP Mail Server (Nodemailer / Gmail)"]
-        OpenRouter["OpenRouter Gateway (openai/gpt-4o-mini)"]
+        GeminiAPI["Google Gemini Flash (Google AI Studio)"]
     end
 
     Client -->|SSE Request| StreamAPI
@@ -57,18 +57,17 @@ flowchart TD
     StreamAPI --> LangGraphLayer
     RestAPI --> LangGraphLayer
 
-    Agent1 -->|Structured Zod Output| Router
-    Router -->|intent: profile_query| PineconeNode
-    Router -->|intent: schedule_enquiry| Coordinator
+    Node1 -->|Structured Classification & Intent| Router
+    Router -->|intent: profile_query| Slicer
+    Router -->|direct / greeting / schedule / OTP| DirectComplete
 
-    PineconeNode --> PineconeDB
-    PineconeNode --> Agent2
-    Agent2 --> Agent3
-    Agent3 --> OpenRouter
+    Slicer --> ProfileJSON
+    Slicer --> Node2
+    Node2 --> Node3
+    Node3 --> GeminiAPI
 
-    Coordinator --> OpenRouter
-    Coordinator --> Tools
-    Tools -->|request_contact_details| Coordinator
+    Node1 --> Tools
+    DirectComplete --> GeminiAPI
     Tools -->|send_verification_otp| BullQueue
     Tools -->|verify_otp| RedisDB
     Tools -->|schedule_enquiry| RedisDB
@@ -83,34 +82,38 @@ flowchart TD
 
 ## 2. Multi-Agent LangGraph State Machine
 
-The core intelligence is modeled as a stateful computational graph using **LangGraph.js** (`src/agent/graph.ts`).
+The core intelligence is modeled as a stateful computational graph using **LangGraph.js** ([src/agent/graph.ts](../src/agent/graph.ts)).
 
-### State Schema (`AgentState`)
+### Execution Flow & Token Optimization
+The pipeline is designed with a **3-tier architecture** to minimize token consumption and maximize response speed:
+
+1. **Phase 1: Router, Direct Chat & UI Actions (`firstRouterAndUiNode`)**
+   - Natural language intent extraction: detects user contact info (`name`, `email`, `phone`, `reason`), OTP codes, or intent.
+   - For greetings, general conversation, or UI events (OTP verification, contact collection, booking confirmation), it generates the final response **immediately in Phase 1 (1 single AI call)**, bypassing subsequent stages and saving tokens.
+   - For knowledge queries about Vyshnav, it classifies the target categories (e.g., `['experience']`, `['projects']`, `['skills']`) and routes to Phase 2.
+
+2. **Phase 2: In-Memory Profile Slicing & Fact Extraction (`secondExtractorNode`)**
+   - **Zero-Token Profile Slicing**: Slices only the required category from [src/data/profile.json](../src/data/profile.json) in-memory in `0ms` with zero AI tokens.
+   - Sends the sliced JSON and user query to Google Gemini with a structured schema (`relevantFacts: string[]`, `found: boolean`), isolating strictly verified facts and preventing hallucination.
+
+3. **Phase 3: Final Response Synthesizer (`thirdGeneratorNode`)**
+   - Synthesizes the extracted facts into a natural, friendly answer in the persona of **Yoho**.
+   - **Strict Formatting Guardrails**: Clean plain text with standard `-` bullets, zero HTML tags (`<br>`, `<table>`, etc.), and zero unsolicited wrap-ups or tips at the end.
+
+### State Schema (`AgentStateType`)
 
 ```typescript
-export interface AgentState {
-  messages: BaseMessage[];              // Full conversational history
-  intent?: 'profile_query' | 'schedule_enquiry'; // Extracted intent
-  keywords?: string[];                 // Search queries for vector retrieval
-  retrievedDocs?: Document[];          // Chunks fetched from Pinecone or local profile
-  filteredDocs?: Document[];           // Chunks validated by Agent 2
-  leadInfo?: {                         // Captured contact info across turns
-    name?: string;
-    email?: string;
-    phone?: string;
-    reason?: string;
-    preferredDate?: string;
-    preferredTime?: string;
-  };
-  isVerified?: boolean;                // Email OTP verification status
-  uiAction?: {                         // Generative UI action payload
-    type: 'form_input' | 'otp_input';
-    title?: string;
-    description?: string;
-    email?: string;
-    fields?: Array<{ name: string; type: string; label: string; required: boolean }>;
-    error?: string;
-  } | null;
+export interface AgentStateType {
+  messages: BaseMessage[];              // Conversational history
+  intent?: 'profile_query' | 'schedule_enquiry' | 'general_chat' | 'direct';
+  categories?: string[];                // Target keys for profile.json slicing
+  slicedData?: Record<string, any>;     // In-memory sliced JSON payload
+  relevantFacts?: string[];             // Factual bullet points extracted by Phase 2
+  retrievedDocs?: RetrievedDocument[];  // Structured doc slices
+  leadInfo?: LeadInfo;                  // Captured visitor contact details across turns
+  isVerified?: boolean;                 // Email OTP verification status
+  uiAction?: UiAction | null;           // Generative UI action descriptor
+  finalMessage?: string;                // Final synthesized plain-text response
 }
 ```
 
@@ -118,17 +121,33 @@ export interface AgentState {
 
 | Node Name | File | Primary Responsibility | Model / Engine |
 | :--- | :--- | :--- | :--- |
-| **`agent1KeywordExtractor`** | [nodes.ts](../src/agent/nodes.ts) | Classifies intent into `profile_query` or `schedule_enquiry` and extracts semantic keywords. Uses `llm.withStructuredOutput(intentSchema)` to guarantee 100% JSON validity with zero text hallucinations. | GPT-4o-mini |
-| **`pineconeRetrievalNode`** | [nodes.ts](../src/agent/nodes.ts) | Converts extracted keywords into vector queries and retrieves top-$k$ relevant chunks from Pinecone. Gracefully falls back to local `src/data/profile.md` if Pinecone is unconfigured. | `text-embedding-3-small` / Pinecone |
-| **`agent2RelevanceClassifier`** | [nodes.ts](../src/agent/nodes.ts) | Evaluates retrieved chunks against user intent to strip false-positive vector matches before synthesis. | GPT-4o-mini |
-| **`agent3ProfileSynthesizer`** | [nodes.ts](../src/agent/nodes.ts) | Synthesizes friendly, concise portfolio answers strictly using validated chunks. Persona: **Yoho**. Web search is disabled and forbidden. | GPT-4o-mini |
-| **`enquiryCoordinatorNode`** | [nodes.ts](../src/agent/nodes.ts) | Multi-turn booking coordinator. Evaluates user messages with native AI tool-calling to collect details, issue OTPs, verify OTPs, and book consultations. Enforces mandatory 24h SLA. | GPT-4o-mini (Tool Calling) |
+| **`firstRouterAndUiNode`** | [nodes.ts](../src/agent/nodes.ts) | Classifies intent, extracts contact details & OTP codes, handles UI events, and resolves direct chats in 1 AI call. | Google Gemini Flash |
+| **`secondExtractorNode`** | [nodes.ts](../src/agent/nodes.ts) | Slices `profile.json` in-memory and extracts relevant factual bullets via structured output. | Google Gemini Flash |
+| **`thirdGeneratorNode`** | [nodes.ts](../src/agent/nodes.ts) | Synthesizes final plain-text response as Yoho without HTML tags or unsolicited concluding tips. | Google Gemini Flash |
 
 ---
 
-## 3. Generative UI Action Architecture
+## 3. Ground Truth Data Architecture (`profile.json`)
 
-To deliver an exceptional user experience, the backend does not rely on rigid if-else conditional ladders. Instead, **the AI model autonomously decides when to trigger client-side interactive UI components**.
+To ensure 100% deterministic, zero-hallucination answers without vector embedding drifts or token overhead:
+- All portfolio records are centralized in **[src/data/profile.json](../src/data/profile.json)** (and mirrored at `data/profile.json`).
+- `src/services/profileLoader.ts` provides typed in-memory access to:
+  - `personal`: Bio, core philosophy, key metrics, location, availability.
+  - `skills`: Core stack, Generative AI, backend architecture, databases, messaging, cloud/DevOps.
+  - `experience`: SDE-I at Neutrinos, Sunlife Philippines, 1,000–2,000 req/min decision engine, awards.
+  - `projects`: Detailed specs for **Domain Scanner** and **YohoAiAgent**.
+  - `agency`: LixerLab digital agency services.
+  - `engineeringPhilosophy`: The 4 engineering pillars (Lifecycle Ownership, Throughput & Scale, Decoupled Systems, Code Correctness).
+  - `certifications`, `education`, `languages`, and `schedulingPolicy`.
+
+> [!NOTE]
+> `profile.md` is deprecated and no longer required; `profile.json` is the sole source of truth.
+
+---
+
+## 4. Generative UI Action Architecture
+
+The AI model autonomously determines when to trigger interactive client-side components:
 
 ### The Tool-Driven UI Flow
 
@@ -137,12 +156,12 @@ sequenceDiagram
     autonumber
     actor User as User / Frontend
     participant Server as Express SSE Handler
-    participant Agent as enquiryCoordinatorNode
+    participant Agent as firstRouterAndUiNode
     participant Tools as Tool Registry (tools/index.ts)
     participant Redis as Redis Session Store
 
-    User->>Server: "I want to schedule a call with Vyshnav"
-    Server->>Agent: Run enquiryCoordinatorNode
+    User->>Server: "I want to schedule a meeting with Vyshnav"
+    Server->>Agent: Run firstRouterAndUiNode
     Agent->>Agent: Detects missing name and email
     Agent->>Tools: Invoke request_contact_details()
     Tools-->>Agent: Returns uiAction: { type: 'form_input', fields: ['name', 'email', 'reason'] }
@@ -151,7 +170,7 @@ sequenceDiagram
     Note over User: Frontend dynamically mounts inline Contact Details Form!
 
     User->>Server: Submits { name: "Alex", email: "alex@example.com" }
-    Server->>Agent: Run enquiryCoordinatorNode
+    Server->>Agent: Run firstRouterAndUiNode
     Agent->>Tools: Invoke send_verification_otp({ email: "alex@example.com" })
     Tools-->>Agent: Returns uiAction: { type: 'otp_input', email: "alex@example.com", length: 6 }
     Agent-->>Server: Final State with uiAction & AI message
@@ -159,7 +178,7 @@ sequenceDiagram
     Note over User: Frontend dynamically mounts inline 6-Digit OTP Widget!
 
     User->>Server: Submits 6-digit OTP "123456"
-    Server->>Agent: Run enquiryCoordinatorNode
+    Server->>Agent: Run firstRouterAndUiNode
     Agent->>Tools: Invoke verify_otp({ email, otp: "123456" })
     Tools->>Redis: Check SHA-256 hash
     Tools-->>Agent: Verification Success (uiAction: null)
@@ -171,37 +190,13 @@ sequenceDiagram
 
 ### Supported UI Action Descriptors
 
-1. **`form_input`**: Emitted when the user expresses an intent to connect but hasn't provided contact details.
-   ```json
-   {
-     "type": "form_input",
-     "title": "Enter Your Details",
-     "fields": [
-       { "name": "name", "type": "text", "label": "Full Name", "required": true },
-       { "name": "email", "type": "email", "label": "Email Address", "required": true },
-       { "name": "reason", "type": "text", "label": "Purpose / Note", "required": false }
-     ]
-   }
-   ```
+1. **`form_input`**: Emitted when the user wants to schedule or connect but has not provided name and email.
 2. **`otp_input`**: Emitted immediately upon generating and dispatching an email OTP.
-   ```json
-   {
-     "type": "otp_input",
-     "title": "Enter Verification Code",
-     "description": "A 6-digit verification code was sent to alex@example.com.",
-     "email": "alex@example.com",
-     "length": 6,
-     "placeholder": "123456"
-   }
-   ```
 
 ---
 
-## 4. Security & Cryptographic Verification Engine
+## 5. Security & Cryptographic Verification Engine
 
-Meeting scheduling requires email ownership verification to prevent spam and identity spoofing.
-
-### Security Highlights
 - **Cryptographic Random Generation**: OTPs are generated using Node's `crypto.randomInt(100000, 1000000)`.
 - **Zero Plaintext Storage**: Redis never stores OTPs in plain text. Every OTP is hashed with `SHA-256` prior to persistence (`otp:${email}`).
 - **Constant-Time Verification**: Verification uses `crypto.timingSafeEqual(storedHash, providedHash)` to prevent timing side-channel attacks.
@@ -211,7 +206,7 @@ Meeting scheduling requires email ownership verification to prevent spam and ide
 
 ---
 
-## 5. Server-Sent Events (SSE) Streaming Protocol
+## 6. Server-Sent Events (SSE) Streaming Protocol
 
 Real-time streaming is implemented via `POST /api/chat/stream` and `GET /api/chat/stream`.
 
@@ -228,8 +223,8 @@ sequenceDiagram
     Server->>Client: Headers: Content-Type: text/event-stream, X-Accel-Buffering: no
     
     Server->>Client: event: status\ndata: {"status": "understanding_query"}
-    Server->>Client: event: status\ndata: {"status": "searching_knowledge_base"}
-    Server->>Client: event: status\ndata: {"status": "generating_answer"}
+    Server->>Client: event: status\ndata: {"status": "extracting_facts"}
+    Server->>Client: event: status\ndata: {"status": "synthesizing_answer"}
     
     loop Stream Output
         Agent->>Server: Yield chunk
@@ -244,35 +239,15 @@ sequenceDiagram
     Server->>Client: event: done\ndata: {"reply": "...", "conversationId": "..."}
 ```
 
-### Frontend Streaming Rules
-1. **Chat Input Remains Always Interactive**:
-   The chat text `<input>` or `<textarea>` must **never** be disabled during streaming. The user should be able to continue typing their next message without interruptions.
-2. **Disable Only the Send Button**:
-   Only the Send button (`disabled={isStreaming || !input.trim()}`) and the Enter-key trigger are locked while streaming is active.
-3. **Lazy Message Creation**:
-   The frontend must not render empty assistant bubbles or bot avatars during the initial status events. It only instantiates the assistant message when the first `event: token` or `event: ui_action` arrives.
-
 ---
 
-## 6. Vector Ingestion & Grounding Guardrails
+## 7. Configuration & Multi-Provider Architecture
 
-### Knowledge Base Pipeline (`src/scripts/ingest.ts`)
-1. Reads `src/data/profile.md` (containing Vyshnav's background, work history, projects, tech stack, and contact links).
-2. Recursively splits text into overlapping semantic chunks (500 characters, 50 character overlap).
-3. Generates vector embeddings via OpenAI `text-embedding-3-small` (1536 dimensions).
-4. Upserts records into Pinecone Serverless Index with metadata (`source`, `text`, `section`).
+The agent supports automatic routing across multiple LLM providers configured via environment variables:
 
-### Guardrails
-- **Strictly Grounded**: Agent 3's prompt explicitly instructs: *"You are Yoho, an AI assistant for Vyshnav P C. You must answer questions ONLY using the retrieved context. Never assume or fabricate details. Web searching is strictly prohibited."*
-- **Mandatory SLA Commitment**: Any meeting booking response is automatically audited by the coordinator to ensure the exact phrase *"Vyshnav will personally get in touch within 24 hours"* is present before returning to the user.
-
----
-
-## 7. Reliability, Budget Optimization & Configuration
-
-- **Token Reservation Control**: Configured with `maxTokens: 1000` across all OpenRouter model instances to prevent HTTP 402 ("Request requires more credits or fewer max_tokens") caused by default 16k token reservations on low balances.
-- **Deterministic Testing**: Vitest test runner is configured with `--no-file-parallelism` to prevent concurrent API rate-limit spikes during test execution.
-- **Resilience**: If Pinecone or Redis are unreachable, the service continues to operate with local profile fallback and in-memory session management.
+- **Primary Provider**: Google Gemini Flash (`gemini-flash-lite-latest` via Google AI Studio).
+- **Alternative Providers**: Groq (`openai/gpt-oss-120b`), NVIDIA NIM (`nvidia/nemotron-3.5-lightning-30b-a3b`), and OpenRouter (`openrouter/free`).
+- **Token Configuration**: `maxTokens: 2048` configured in `src/agent/nodes.ts` to ensure detailed profile and work experience responses are rendered fully without truncation.
 
 ---
 
@@ -280,12 +255,13 @@ sequenceDiagram
 
 - [src/server.ts](../src/server.ts) — Express REST & SSE streaming server.
 - [src/agent/graph.ts](../src/agent/graph.ts) — LangGraph state graph compilation and routing.
-- [src/agent/nodes.ts](../src/agent/nodes.ts) — Graph nodes (Agent 1, Agent 2, Agent 3, Pinecone Retrieval, Coordinator).
+- [src/agent/nodes.ts](../src/agent/nodes.ts) — Graph nodes (`firstRouterAndUiNode`, `secondExtractorNode`, `thirdGeneratorNode`).
 - [src/agent/state.ts](../src/agent/state.ts) — TypeScript state channel schemas.
+- [src/data/profile.json](../src/data/profile.json) — Ground-truth structured portfolio database.
+- [src/services/profileLoader.ts](../src/services/profileLoader.ts) — Typed in-memory profile JSON loader and category slicer.
 - [src/tools/index.ts](../src/tools/index.ts) — AI tools and generative UI action definitions.
 - [src/services/otpService.ts](../src/services/otpService.ts) — Cryptographic OTP generation, hashing, and verification.
 - [src/services/redisClient.ts](../src/services/redisClient.ts) — Redis client connection and key utilities.
-- [src/services/pineconeService.ts](../src/services/pineconeService.ts) — Pinecone vector retrieval and fallback logic.
 - [src/queues/emailQueue.ts](../src/queues/emailQueue.ts) — BullMQ email queue producer.
 - [src/workers/emailWorker.ts](../src/workers/emailWorker.ts) — BullMQ background worker with Nodemailer SMTP.
 - [docs/FRONTEND_INTEGRATION_GUIDE.md](FRONTEND_INTEGRATION_GUIDE.md) — Comprehensive frontend SSE integration guide with React/Next.js code.

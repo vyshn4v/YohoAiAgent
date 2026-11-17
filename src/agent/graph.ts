@@ -1,53 +1,52 @@
 import { StateGraph, END, START } from '@langchain/langgraph';
 import { AgentAnnotation, AgentStateType } from './state.js';
 import {
-  agent1KeywordExtractor,
-  pineconeRetrievalNode,
-  agent2RelevanceClassifier,
-  agent3ProfileSynthesizer,
-  enquiryCoordinatorNode,
+  firstRouterAndUiNode,
+  secondExtractorNode,
+  thirdGeneratorNode,
 } from './nodes.js';
 
 /**
- * Builds the Multi-Agent LangGraph workflow.
+ * 3-Tier Multi-Agent LangGraph Workflow:
  *
  * Flow:
- * START -> agent1_keyword_extractor
- *        |-- (intent == 'schedule_enquiry') --> enquiry_coordinator -> END
- *        |-- (default) --> pinecone_retrieval -> agent2_relevance_classifier -> agent3_profile_synthesizer -> END
+ * START -> first_router_and_ui (AI Call 1: Router, Direct Chat & UI Actions)
+ *        |-- (direct / UI / informal / schedule / OTP) --> END (1 single AI call, saves maximum tokens!)
+ *        |-- (knowledge query) --> second_extractor (AI Call 2: In-memory sliced JSON fact extraction)
+ *                                  -> third_generator (AI Call 3: Response synthesis as Yoho) -> END
  */
 export function buildAgentGraph() {
   const workflow = new StateGraph(AgentAnnotation)
-    // Register nodes
-    .addNode('agent1_keyword_extractor', agent1KeywordExtractor)
-    .addNode('pinecone_retrieval', pineconeRetrievalNode)
-    .addNode('agent2_relevance_classifier', agent2RelevanceClassifier)
-    .addNode('agent3_profile_synthesizer', agent3ProfileSynthesizer)
-    .addNode('enquiry_coordinator', enquiryCoordinatorNode)
+    // 3 Core Nodes
+    .addNode('first_router_and_ui', firstRouterAndUiNode)
+    .addNode('second_extractor', secondExtractorNode)
+    .addNode('third_generator', thirdGeneratorNode)
 
-    // Entry point
-    .addEdge(START, 'agent1_keyword_extractor')
+    // Entry point: AI Call 1
+    .addEdge(START, 'first_router_and_ui')
 
-    // Conditional routing after Agent 1
+    // Conditional Routing after AI Call 1
     .addConditionalEdges(
-      'agent1_keyword_extractor',
+      'first_router_and_ui',
       (state: AgentStateType) => {
-        if (state.intent === 'schedule_enquiry') {
-          return 'enquiry_coordinator';
+        if (
+          state.intent === 'schedule_enquiry' ||
+          state.intent === 'general_chat' ||
+          state.intent === 'direct'
+        ) {
+          return END;
         }
-        return 'pinecone_retrieval';
+        return 'second_extractor';
       },
       {
-        enquiry_coordinator: 'enquiry_coordinator',
-        pinecone_retrieval: 'pinecone_retrieval',
+        [END]: END,
+        second_extractor: 'second_extractor',
       }
     )
 
-    // Multi-Agent RAG pipeline sequence
-    .addEdge('pinecone_retrieval', 'agent2_relevance_classifier')
-    .addEdge('agent2_relevance_classifier', 'agent3_profile_synthesizer')
-    .addEdge('agent3_profile_synthesizer', END)
-    .addEdge('enquiry_coordinator', END);
+    // Knowledge pipeline
+    .addEdge('second_extractor', 'third_generator')
+    .addEdge('third_generator', END);
 
   return workflow.compile();
 }
