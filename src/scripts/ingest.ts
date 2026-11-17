@@ -70,8 +70,39 @@ export async function ingestProfileData(): Promise<{ success: boolean; count: nu
       });
     }
 
+    const targetNamespace = index.namespace(config.pinecone.namespace);
+
+    // Remove stale records owned by this profile ingestion before upserting fresh vectors
+    try {
+      const staleIds: string[] = [];
+      const prefixes = ['profile-', 'chunk-md-'];
+      for (const prefix of prefixes) {
+        let paginationToken: string | undefined = undefined;
+        do {
+          const listRes = await targetNamespace.listPaginated({ prefix, paginationToken });
+          if (listRes.vectors && listRes.vectors.length > 0) {
+            for (const v of listRes.vectors) {
+              if (v.id) staleIds.push(v.id);
+            }
+          }
+          paginationToken = listRes.pagination?.next;
+        } while (paginationToken);
+      }
+
+      if (staleIds.length > 0) {
+        console.log(`[Ingest] Removing ${staleIds.length} stale profile records from namespace '${config.pinecone.namespace}'...`);
+        const batchSize = 250;
+        for (let b = 0; b < staleIds.length; b += batchSize) {
+          const batch = staleIds.slice(b, b + batchSize);
+          await targetNamespace.deleteMany(batch);
+        }
+      }
+    } catch (cleanErr: any) {
+      console.warn('[Ingest] Warning: Could not remove prior profile records:', cleanErr?.message || cleanErr);
+    }
+
     console.log(`[Ingest] Upserting ${vectors.length} vectors to Pinecone namespace '${config.pinecone.namespace}'...`);
-    await index.namespace(config.pinecone.namespace).upsert(vectors);
+    await targetNamespace.upsert(vectors);
 
     console.log('[Ingest] Ingestion complete successfully!');
     return {

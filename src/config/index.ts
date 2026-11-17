@@ -17,55 +17,56 @@ if (existingNodeEnv) {
   process.env.NODE_ENV = existingNodeEnv;
 }
 
-export const config = {
-  port: parseInt(process.env.PORT || '3000', 10),
-  nodeEnv: process.env.NODE_ENV || 'development',
+// Resolve provider selection once, preserving precedence and defaults
+const resolvedProvider =
+  process.env.LLM_PROVIDER ||
+  (process.env.GEMINI_API_KEY
+    ? 'gemini'
+    : process.env.GROQ_API_KEY
+    ? 'groq'
+    : process.env.NVIDIA_API_KEY
+    ? 'nvidia'
+    : 'openrouter');
 
-  llm: {
-    provider: process.env.LLM_PROVIDER || (process.env.GEMINI_API_KEY ? 'gemini' : process.env.GROQ_API_KEY ? 'groq' : process.env.NVIDIA_API_KEY ? 'nvidia' : 'openrouter'),
-    apiKey:
-      process.env.LLM_PROVIDER === 'gemini' || (!process.env.LLM_PROVIDER && process.env.GEMINI_API_KEY)
-        ? process.env.GEMINI_API_KEY || ''
-        : process.env.LLM_PROVIDER === 'groq' || (!process.env.LLM_PROVIDER && process.env.GROQ_API_KEY)
-        ? process.env.GROQ_API_KEY || ''
-        : process.env.LLM_PROVIDER === 'nvidia'
-        ? process.env.NVIDIA_API_KEY || ''
-        : process.env.OPENROUTER_API_KEY || '',
-    model:
-      process.env.LLM_PROVIDER === 'gemini' || (!process.env.LLM_PROVIDER && process.env.GEMINI_API_KEY)
-        ? process.env.GEMINI_MODEL || 'gemini-3.5-flash'
-        : process.env.LLM_PROVIDER === 'groq' || (!process.env.LLM_PROVIDER && process.env.GROQ_API_KEY)
-        ? process.env.GROQ_MODEL || 'openai/gpt-oss-120b'
-        : process.env.LLM_PROVIDER === 'nvidia'
-        ? process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b'
-        : process.env.OPENROUTER_MODEL || 'openrouter/free',
-    baseUrl:
-      process.env.LLM_PROVIDER === 'gemini' || (!process.env.LLM_PROVIDER && process.env.GEMINI_API_KEY)
-        ? process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/'
-        : process.env.LLM_PROVIDER === 'groq' || (!process.env.LLM_PROVIDER && process.env.GROQ_API_KEY)
-        ? process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1'
-        : process.env.LLM_PROVIDER === 'nvidia'
-        ? process.env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1'
-        : 'https://openrouter.ai/api/v1',
-  },
-
+const providerConfigs: Record<string, { apiKey: string; model: string; baseUrl: string }> = {
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || '',
     model: process.env.GEMINI_MODEL || 'gemini-3.5-flash',
     baseUrl: process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/',
   },
-
   groq: {
     apiKey: process.env.GROQ_API_KEY || '',
     model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
     baseUrl: process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1',
   },
-
   nvidia: {
     apiKey: process.env.NVIDIA_API_KEY || '',
     model: process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b',
     baseUrl: process.env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1',
   },
+  openrouter: {
+    apiKey: process.env.OPENROUTER_API_KEY || '',
+    model: process.env.OPENROUTER_MODEL || 'openrouter/free',
+    baseUrl: 'https://openrouter.ai/api/v1',
+  },
+};
+
+const activeLlmConfig = providerConfigs[resolvedProvider] || providerConfigs.openrouter;
+
+export const config = {
+  port: parseInt(process.env.PORT || '3000', 10),
+  nodeEnv: process.env.NODE_ENV || 'development',
+
+  llm: {
+    provider: resolvedProvider,
+    apiKey: activeLlmConfig.apiKey,
+    model: activeLlmConfig.model,
+    baseUrl: activeLlmConfig.baseUrl,
+  },
+
+  gemini: providerConfigs.gemini,
+  groq: providerConfigs.groq,
+  nvidia: providerConfigs.nvidia,
 
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY || '',

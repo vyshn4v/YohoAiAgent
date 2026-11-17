@@ -223,7 +223,7 @@ sequenceDiagram
     Server->>Client: Headers: Content-Type: text/event-stream, X-Accel-Buffering: no
     
     Server->>Client: event: status\ndata: {"status": "understanding_query"}
-    Server->>Client: event: status\ndata: {"status": "slicing_profile_data"}
+    Server->>Client: event: status\ndata: {"status": "extracting_facts"}
     Server->>Client: event: status\ndata: {"status": "synthesizing_answer"}
     
     loop Stream Output

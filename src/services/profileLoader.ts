@@ -399,10 +399,14 @@ export function loadProfileSections(): ProfileSectionChunk[] {
     }
   }
 
-  // Markdown fallback
-  const mdPath = path.resolve(__dirname, '../data/profile.md');
-  if (fs.existsSync(mdPath)) {
-    const content = fs.readFileSync(mdPath, 'utf-8');
+  // Markdown fallback: check both candidate paths
+  const mdCandidates = [
+    path.resolve(__dirname, '../data/profile.md'),
+    path.resolve(__dirname, '../../data/profile.md'),
+  ];
+  const foundMdPath = mdCandidates.find((p) => fs.existsSync(p));
+  if (foundMdPath) {
+    const content = fs.readFileSync(foundMdPath, 'utf-8');
     const sections = content.split(/\n(?=## )/g).map((s) => s.trim()).filter(Boolean);
     return sections.map((sec, idx) => {
       const titleMatch = sec.match(/^##\s+(.*)/m);

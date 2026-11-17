@@ -63,6 +63,7 @@ describe('LangGraph Agent Multi-Node Orchestration', () => {
       success: true,
       message: 'Email successfully verified!',
     });
+    vi.spyOn(otpService, 'isEmailVerified').mockResolvedValue(true);
 
     const result = await agentGraph.invoke({
       messages: [

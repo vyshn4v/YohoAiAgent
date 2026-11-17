@@ -171,7 +171,7 @@ async function handleSseChatStream(
 
     const stream = agentGraph.streamEvents(
       { messages: updatedHistory, leadInfo: session.leadInfo },
-      { version: 'v2', runName: 'Portfolio Agent Stream' }
+      { version: 'v2' }
     );
 
     for await (const event of stream) {

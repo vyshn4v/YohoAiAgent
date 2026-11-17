@@ -36,6 +36,20 @@ export function getLlmModel(temperature = 0) {
 
 export const getOpenRouterModel = getLlmModel;
 
+function parseToolOutput(res: any): any {
+  const str =
+    typeof res === 'string'
+      ? res
+      : typeof res?.content === 'string'
+      ? res.content
+      : JSON.stringify(res);
+  try {
+    return JSON.parse(str);
+  } catch {
+    return { status: 'error', message: str };
+  }
+}
+
 function getLastUserMessage(messages: BaseMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i] instanceof HumanMessage || messages[i]._getType() === 'human') {
@@ -46,6 +60,74 @@ function getLastUserMessage(messages: BaseMessage[]): string {
   }
   return '';
 }
+
+function formatRecentHistory(messages: BaseMessage[], limit = 4): string {
+  const recent = messages.slice(-limit);
+  return recent
+    .map((m) => {
+      const type = m._getType() === 'human' || m instanceof HumanMessage ? 'User' : 'Assistant';
+      const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+      return `${type}: ${content}`;
+    })
+    .join('\n');
+}
+
+const canonicalCategoryMap: Record<string, string> = {
+  personal: 'personal',
+  about: 'personal',
+  bio: 'personal',
+  me: 'personal',
+  intro: 'personal',
+  contact: 'contact',
+  social: 'contact',
+  links: 'contact',
+  email: 'contact',
+  phone: 'contact',
+  reach: 'contact',
+  skills: 'skills',
+  tech: 'skills',
+  stack: 'skills',
+  technologies: 'skills',
+  tools: 'skills',
+  experience: 'experience',
+  work: 'experience',
+  job: 'experience',
+  career: 'experience',
+  employment: 'experience',
+  history: 'experience',
+  neutrinos: 'experience',
+  projects: 'projects',
+  project: 'projects',
+  portfolio: 'projects',
+  work_samples: 'projects',
+  domain_scanner: 'projects',
+  domainscanner: 'projects',
+  yohoaiagent: 'projects',
+  yoho: 'projects',
+  agency: 'agency',
+  lixerlab: 'agency',
+  services: 'agency',
+  company: 'agency',
+  engineeringphilosophy: 'engineeringPhilosophy',
+  philosophy: 'engineeringPhilosophy',
+  principles: 'engineeringPhilosophy',
+  engineering_philosophy: 'engineeringPhilosophy',
+  certifications: 'certifications',
+  certificates: 'certifications',
+  courses: 'certifications',
+  education: 'education',
+  college: 'education',
+  degree: 'education',
+  bootcamp: 'education',
+  brototype: 'education',
+  languages: 'languages',
+  language: 'languages',
+  schedulingpolicy: 'schedulingPolicy',
+  scheduling_policy: 'schedulingPolicy',
+  policy: 'schedulingPolicy',
+  meeting_policy: 'schedulingPolicy',
+  booking_policy: 'schedulingPolicy',
+};
 
 /**
  * Phase 1: Router, Natural Language Extractor & UI Handler (AI Call 1)
@@ -102,6 +184,12 @@ export async function firstRouterAndUiNode(state: AgentStateType): Promise<Parti
         .describe(
           "List of category keys from profile.json when isUiOrDirect is false. Available keys: ['personal', 'contact', 'skills', 'experience', 'projects', 'agency', 'engineeringPhilosophy', 'certifications', 'education', 'languages', 'schedulingPolicy']."
         ),
+      resolvedQuestion: z
+        .string()
+        .nullable()
+        .describe(
+          'The user question resolved with explicit subjects using the conversation history (e.g., rewriting pronouns like "it", "they", "that project" into the specific project name such as "What technologies does Domain Scanner use?").'
+        ),
     });
 
     const llm = getOpenRouterModel(0);
@@ -128,7 +216,8 @@ Your role:
       - If Name or Email is missing entirely:
         isUiOrDirect: true, action: "request_info", reply: invite them to share their Name and Email address, mentioning that Vyshnav personally replies within 24 hours.
    D) A factual question about Vyshnav P C (skills, projects, work experience, education, certifications):
-      isUiOrDirect: false, action: "none", categories: matching keys from profile.json (e.g. ["education"], ["skills", "experience"], ["projects"]). Questions about specific projects (Domain Scanner, YohoAiAgent, etc.) must include "projects".`;
+      isUiOrDirect: false, action: "none", categories: matching keys from profile.json (e.g. ["education"], ["skills", "experience"], ["projects"]). Questions about specific projects (Domain Scanner, YohoAiAgent, etc.) must include "projects".
+3. In resolvedQuestion, rewrite the user query to make the subject explicit using prior conversation context (e.g., resolving "What technologies does it use?" into "What technologies does Domain Scanner use?").`;
 
     const result = await structuredLlm.invoke([
       new SystemMessage(systemPrompt),
@@ -155,38 +244,137 @@ Your role:
           email: emailToVerify,
           otp: result.extracted.otp,
         });
-        const parsed = JSON.parse(verifyRes);
-        const replyMsg =
-          parsed.status === 'verified'
-            ? `Your email has been successfully verified! ✅ Vyshnav will review your details and get in touch within 24 hours. 🚀`
-            : `Verification failed: ${parsed.message} Please check your 6-digit code and try again.`;
+        const parsed = parseToolOutput(verifyRes);
 
-        return {
-          intent: 'schedule_enquiry',
-          leadInfo: mergedLeadInfo,
-          messages: [new AIMessage(replyMsg)],
-          uiAction: parsed,
-        };
+        if (parsed.status !== 'verified') {
+          const replyMsg = `Verification failed: ${parsed.message || 'Invalid code.'} Please check your 6-digit code and try again.`;
+          return {
+            intent: 'schedule_enquiry',
+            leadInfo: mergedLeadInfo,
+            messages: [new AIMessage(replyMsg)],
+            uiAction: parsed.uiAction ?? null,
+          };
+        }
+
+        // Email verified successfully - collect any missing details before invoking scheduleEnquiryTool
+        if (!mergedLeadInfo.name) {
+          const replyMsg = `Your email has been successfully verified! ✅ Could you please provide your full name so I can finalize your consultation booking?`;
+          return {
+            intent: 'schedule_enquiry',
+            leadInfo: mergedLeadInfo,
+            isVerified: true,
+            messages: [new AIMessage(replyMsg)],
+            uiAction: null,
+          };
+        }
+
+        // Invoke scheduleEnquiryTool before ending the graph
+        const scheduleRes = await scheduleEnquiryTool.invoke({
+          name: mergedLeadInfo.name,
+          email: emailToVerify,
+          phone: mergedLeadInfo.phone || 'Not provided',
+          reason: mergedLeadInfo.reason || 'General portfolio consultation / enquiry',
+        });
+        const scheduleParsed = parseToolOutput(scheduleRes);
+
+        if (scheduleParsed.status === 'confirmed') {
+          const replyMsg = `Your email has been successfully verified! ✅ Vyshnav will review your details and get in touch within 24 hours. 🚀`;
+          return {
+            intent: 'schedule_enquiry',
+            leadInfo: mergedLeadInfo,
+            isVerified: true,
+            messages: [new AIMessage(replyMsg)],
+            uiAction: null,
+          };
+        } else {
+          const replyMsg = `Your email was verified, but we were unable to finalize your consultation: ${scheduleParsed.message || 'Please try again.'}`;
+          return {
+            intent: 'schedule_enquiry',
+            leadInfo: mergedLeadInfo,
+            isVerified: true,
+            messages: [new AIMessage(replyMsg)],
+            uiAction: null,
+          };
+        }
       }
 
-      // 2. Send OTP (only when both name and email are present)
+      // 2. Schedule action
+      if (result.action === 'schedule') {
+        if (!mergedLeadInfo.name || !mergedLeadInfo.email) {
+          const missing = !mergedLeadInfo.name && !mergedLeadInfo.email ? 'Name and Email address' : !mergedLeadInfo.name ? 'full name' : 'email address';
+          const replyMsg = `To schedule your consultation, please share your ${missing}. Vyshnav personally reviews all requests and replies within 24 hours!`;
+          return {
+            intent: 'schedule_enquiry',
+            leadInfo: mergedLeadInfo,
+            messages: [new AIMessage(replyMsg)],
+            uiAction: null,
+          };
+        }
+
+        const scheduleRes = await scheduleEnquiryTool.invoke({
+          name: mergedLeadInfo.name,
+          email: mergedLeadInfo.email,
+          phone: mergedLeadInfo.phone || 'Not provided',
+          reason: mergedLeadInfo.reason || 'General portfolio consultation / enquiry',
+        });
+        const scheduleParsed = parseToolOutput(scheduleRes);
+
+        if (scheduleParsed.status === 'confirmed') {
+          const replyMsg = `Your consultation is confirmed! ✅ Vyshnav will review your details and personally get in touch within 24 hours. 🚀`;
+          return {
+            intent: 'schedule_enquiry',
+            leadInfo: mergedLeadInfo,
+            isVerified: true,
+            messages: [new AIMessage(replyMsg)],
+            uiAction: null,
+          };
+        } else if (scheduleParsed.status === 'unverified') {
+          const otpRes = await sendVerificationOtpTool.invoke({
+            email: mergedLeadInfo.email,
+            name: mergedLeadInfo.name,
+          });
+          const otpParsed = parseToolOutput(otpRes);
+          const isSent = otpParsed.status === 'sent';
+          const replyMsg = isSent
+            ? `A 6-digit verification code has been dispatched to ${mergedLeadInfo.email}! 🔐 Please enter the code here to confirm your request. Vyshnav personally replies within 24 hours!`
+            : `We encountered an issue sending the verification code to ${mergedLeadInfo.email}: ${otpParsed.message || 'Delivery error'}. Please try again.`;
+          return {
+            intent: 'schedule_enquiry',
+            leadInfo: mergedLeadInfo,
+            messages: [new AIMessage(replyMsg)],
+            uiAction: otpParsed.uiAction ?? null,
+          };
+        } else {
+          return {
+            intent: 'schedule_enquiry',
+            leadInfo: mergedLeadInfo,
+            messages: [new AIMessage(`Could not complete your enquiry: ${scheduleParsed.message}`)],
+            uiAction: null,
+          };
+        }
+      }
+
+      // 3. Send OTP (only when both name and email are present)
       if (result.action === 'send_otp' && mergedLeadInfo.email && mergedLeadInfo.name) {
         const otpRes = await sendVerificationOtpTool.invoke({
           email: mergedLeadInfo.email,
           name: mergedLeadInfo.name,
         });
-        const parsed = JSON.parse(otpRes);
-        const replyMsg = `A 6-digit verification code has been dispatched to ${mergedLeadInfo.email}! 🔐 Please enter the 6-digit verification code here to confirm your request. Vyshnav personally replies within 24 hours!`;
+        const parsed = parseToolOutput(otpRes);
+        const isSuccess = parsed.status === 'sent';
+        const replyMsg = isSuccess
+          ? `A 6-digit verification code has been dispatched to ${mergedLeadInfo.email}! 🔐 Please enter the 6-digit verification code here to confirm your request. Vyshnav personally replies within 24 hours!`
+          : `We encountered an issue sending the verification code to ${mergedLeadInfo.email}: ${parsed.message || 'Delivery failed'}. Please check your email address and try again.`;
 
         return {
           intent: 'schedule_enquiry',
           leadInfo: mergedLeadInfo,
           messages: [new AIMessage(replyMsg)],
-          uiAction: parsed,
+          uiAction: parsed.uiAction ?? null,
         };
       }
 
-      // 3. Request info or greeting response
+      // 4. Request info or greeting response
       let finalReply =
         result.reply ||
         "I'd love to help you connect with Vyshnav! Please share your Name and Email address so I can send an OTP to verify your request.";
@@ -201,11 +389,12 @@ Your role:
       };
     }
 
-  // Knowledge query: passes category keys to Phase 2
+  // Knowledge query: passes category keys and resolved question to Phase 2
   return {
     intent: 'profile_query',
     categories:
       result.categories && result.categories.length > 0 ? result.categories : ['personal', 'skills'],
+    extractedKeywords: result.resolvedQuestion || lastMessage,
   };
 }
 
@@ -218,7 +407,9 @@ Your role:
  * Sends user question + sliced data to AI Call 2 to strictly extract relevant facts.
  */
 export async function secondExtractorNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  const userQuery = getLastUserMessage(state.messages);
+  const lastUserQuery = getLastUserMessage(state.messages);
+  const resolvedQuery = state.extractedKeywords || lastUserQuery;
+  const conversationContext = formatRecentHistory(state.messages);
   const categories =
     state.categories && state.categories.length > 0 ? state.categories : ['personal', 'skills'];
 
@@ -227,10 +418,23 @@ export async function secondExtractorNode(state: AgentStateType): Promise<Partia
   const slicedData: Record<string, any> = {};
 
   for (const cat of categories) {
-    const key = cat.toLowerCase().trim() === 'about' ? 'personal' : cat.trim();
-    if ((profile as any)[key]) {
-      slicedData[key] = (profile as any)[key];
+    const normalized = cat.toLowerCase().trim().replace(/[^a-z0-9_]/g, '');
+    const canonicalKey = canonicalCategoryMap[normalized] || (cat.toLowerCase().trim() === 'about' ? 'personal' : cat.trim());
+    if ((profile as any)[canonicalKey]) {
+      slicedData[canonicalKey] = (profile as any)[canonicalKey];
     }
+  }
+
+  // If a category cannot be resolved, recover before invoking the extractor rather than passing an empty slice
+  if (Object.keys(slicedData).length === 0) {
+    slicedData.personal = profile.personal;
+    slicedData.skills = profile.skills;
+    slicedData.projects = profile.projects;
+  }
+
+  // Keep the complete projects slice available to both extraction and generation stages
+  if (!slicedData.projects && profile.projects) {
+    slicedData.projects = profile.projects;
   }
 
   // Synthesize retrievedDocs from sliced keys for test compatibility
@@ -254,14 +458,14 @@ export async function secondExtractorNode(state: AgentStateType): Promise<Partia
   const structuredLlm = llm.withStructuredOutput(extractorSchema);
 
   const systemPrompt = `You are AI Agent 2 (Targeted Fact Extractor) for Vyshnav P C's portfolio.
-You are given a strictly filtered slice of profile.json corresponding to the requested categories.
-Your job is to read the provided JSON slice and extract ONLY the facts that directly answer the user's question.
+You are given conversation context, the resolved user question, and a filtered slice of profile.json.
+Your job is to read the provided JSON slice and extract ONLY the facts that directly answer the user's question, preserving any subject or context from previous turns.
 Return strict JSON with relevantFacts and found.`;
 
   const result = await structuredLlm.invoke([
     new SystemMessage(systemPrompt),
     new HumanMessage(
-      `USER QUESTION: "${userQuery}"\n\nSLICED PROFILE DATA (JSON):\n${JSON.stringify(slicedData, null, 2)}`
+      `RECENT CONVERSATION CONTEXT:\n${conversationContext}\n\nUSER QUESTION (RESOLVED):\n"${resolvedQuery}"\n\nSLICED PROFILE DATA (JSON):\n${JSON.stringify(slicedData, null, 2)}`
     ),
   ]);
 
@@ -269,6 +473,7 @@ Return strict JSON with relevantFacts and found.`;
     slicedData,
     relevantFacts: result.relevantFacts || [],
     retrievedDocs,
+    extractedKeywords: resolvedQuery,
   };
 }
 
@@ -277,7 +482,9 @@ Return strict JSON with relevantFacts and found.`;
  * Synthesizes the extracted facts into a polished, natural answer from Yoho.
  */
 export async function thirdGeneratorNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  const userQuery = getLastUserMessage(state.messages);
+  const lastUserQuery = getLastUserMessage(state.messages);
+  const resolvedQuery = state.extractedKeywords || lastUserQuery;
+  const conversationContext = formatRecentHistory(state.messages);
   const facts = state.relevantFacts || [];
   const factsText = facts.join('\n- ');
 
@@ -295,7 +502,9 @@ STRICT RULES:
 
   const response = await llm.invoke([
     new SystemMessage(systemPrompt),
-    new HumanMessage(`USER QUESTION: "${userQuery}"\n\nDATA FROM AI 2 (VERIFIED FACTS):\n- ${factsText}`),
+    new HumanMessage(
+      `RECENT CONVERSATION CONTEXT:\n${conversationContext}\n\nUSER QUESTION (RESOLVED):\n"${resolvedQuery}"\n\nDATA FROM AI 2 (VERIFIED FACTS):\n- ${factsText}`
+    ),
   ]);
 
   const finalMessage = typeof response.content === 'string' ? response.content.trim() : JSON.stringify(response.content);

@@ -129,7 +129,7 @@ Key environment variables:
 | `REDIS_HOST`, `REDIS_PORT` | Connection host and port for Redis | `localhost`, `6379` |
 | `REDIS_PASSWORD` | Redis password (leave empty if none) | `""` |
 | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS` | SMTP credentials for sending verification emails | — |
-| `HOST_EMAIL` | Destination inbox for verified lead notifications | `vyshnavpcnaravoor@gmail.com` |
+| `HOST_EMAIL` | Destination inbox for verified lead notifications (users should configure a valid destination for notifications) | `vyshnav@example.com` |
 | `CORS_ORIGIN` | Allowed CORS origins | `*` |
 
 ### 3. Ground Truth Profile Database (`src/data/profile.json`)

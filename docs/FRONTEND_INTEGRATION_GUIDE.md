@@ -49,7 +49,7 @@ event: status
 data: {"node":"first_router_and_ui","status":"understanding_query"}
 
 event: status
-data: {"node":"second_extractor","status":"slicing_profile_data"}
+data: {"node":"second_extractor","status":"extracting_facts"}
 
 event: status
 data: {"node":"third_generator","status":"generating_answer"}

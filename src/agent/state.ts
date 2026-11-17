@@ -50,6 +50,10 @@ export const AgentAnnotation = Annotation.Root({
     reducer: (current, next) => ({ ...current, ...next }),
     default: () => ({}),
   }),
+  isVerified: Annotation<boolean>({
+    reducer: (_, next) => next,
+    default: () => false,
+  }),
   uiAction: Annotation<Record<string, any> | null>({
     reducer: (_, next) => next,
     default: () => null,
