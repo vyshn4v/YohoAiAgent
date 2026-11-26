@@ -1,6 +1,5 @@
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { PDFParse } from 'pdf-parse';
 import { generateTextEmbedding } from '../services/embeddingService.js';
 import {
@@ -9,9 +8,6 @@ import {
   ChunkInput,
   closePgPool,
 } from '../services/pgVectorService.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 export function parseArgs(argv: string[]): { filePath: string } {
   const fileArgIndex = argv.indexOf('--file');

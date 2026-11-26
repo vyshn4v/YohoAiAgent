@@ -9,17 +9,10 @@ import { getConversationSession, saveConversationSession } from './sessionStore.
 
 const NODE_STATUS_MAP: Record<string, string> = {
   decision_router: 'understanding_query',
-  first_router_and_ui: 'understanding_query',
-  agent1_keyword_extractor: 'understanding_query',
   greeting_small_model: 'greeting',
   pgvector_retriever: 'extracting_facts',
-  second_extractor: 'extracting_facts',
-  agent2_relevance_classifier: 'extracting_facts',
   knowledge_big_model: 'generating_answer',
-  third_generator: 'generating_answer',
-  agent3_profile_synthesizer: 'generating_answer',
   schedule_enquiry: 'processing_enquiry',
-  enquiry_coordinator: 'processing_enquiry',
 };
 
 /**

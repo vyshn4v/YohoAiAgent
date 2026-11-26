@@ -72,6 +72,5 @@ export async function pgVectorRetrieverNode(
   log.done({ source: docSource, docs: retrievedDocs.length });
   return {
     retrievedDocs,
-    classifiedDocs: retrievedDocs,
   };
 }

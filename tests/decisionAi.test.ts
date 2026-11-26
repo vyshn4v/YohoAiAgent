@@ -42,7 +42,7 @@ describe('Decision AI & 4-Tier Model Routing', () => {
           id: 'chunk-1',
           chunkIndex: 0,
           title: 'Technical Skills',
-          content: 'LangGraph, TypeScript, Node.js, Python, Pinecone, BullMQ',
+          content: 'LangGraph, TypeScript, Node.js, Python, PostgreSQL pgvector, BullMQ',
           metadata: { page: 1 },
           similarity: 0.92,
         },

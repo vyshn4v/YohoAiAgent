@@ -59,7 +59,7 @@ export const swaggerDocument = {
                 schema: {
                   type: 'string',
                   example:
-                    'event: status\ndata: {"node":"agent1_keyword_extractor","status":"understanding_query"}\n\n' +
+                    'event: status\ndata: {"node":"decision_router","status":"understanding_query"}\n\n' +
                     'event: token\ndata: {"token":"Vyshnav","conversationId":"..."}\n\n' +
                     'event: ui_action\ndata: {"type":"otp_input","title":"Enter 6-Digit Verification Code","email":"user@example.com","length":6}\n\n' +
                     'event: done\ndata: {"reply":"...","intent":"schedule_enquiry","uiAction":{"type":"otp_input","email":"user@example.com","length":6}}\n\n',

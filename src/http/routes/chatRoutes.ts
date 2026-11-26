@@ -79,7 +79,7 @@ export function createChatRouter(): Router {
       );
 
       const uiAction = finalState.uiAction || null;
-      const retrievedCount = finalState.classifiedDocs?.length || finalState.retrievedDocs?.length || 0;
+      const retrievedCount = finalState.retrievedDocs?.length || 0;
       log.done({ intent: finalState.intent, retrievedCount, replyLen: replyText.length });
 
       res.json({

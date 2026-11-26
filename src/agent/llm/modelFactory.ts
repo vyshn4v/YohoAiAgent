@@ -62,10 +62,6 @@ export function getKnowledgeBigModel(temperature = 0.2): ChatOpenAI {
   return createModelInstance(config.models?.big || 'gemini-3.5-flash-lite', temperature);
 }
 
-// Backward compatibility aliases
-export const getLlmModel = getKnowledgeBigModel;
-export const getOpenRouterModel = getGreetingSmallModel;
-
 /**
  * Invokes a ChatOpenAI model and automatically retries with a fallback model on 404 / MODEL_NOT_FOUND.
  */

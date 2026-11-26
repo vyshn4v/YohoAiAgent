@@ -1,5 +1,4 @@
 import dotenv from 'dotenv';
-import path from 'path';
 
 const existingNodeEnv = process.env.NODE_ENV;
 // Load environment variables from .env file

@@ -24,27 +24,12 @@ export const AgentAnnotation = Annotation.Root({
     | 'greeting'
     | 'profile_query'
     | 'schedule_enquiry'
-    | 'general_chat'
     | 'direct'
     | 'out_of_scope'
-    | 'knowledge'
-    | 'knowledge_query'
     | string
   >({
     reducer: (_, next) => next,
     default: () => 'profile_query',
-  }),
-  categories: Annotation<string[]>({
-    reducer: (_, next) => next,
-    default: () => [],
-  }),
-  slicedData: Annotation<Record<string, any>>({
-    reducer: (_, next) => next,
-    default: () => ({}),
-  }),
-  relevantFacts: Annotation<string[]>({
-    reducer: (_, next) => next,
-    default: () => [],
   }),
   finalMessage: Annotation<string>({
     reducer: (_, next) => next,
@@ -55,10 +40,6 @@ export const AgentAnnotation = Annotation.Root({
     default: () => '',
   }),
   retrievedDocs: Annotation<RetrievedDocument[]>({
-    reducer: (_, next) => next,
-    default: () => [],
-  }),
-  classifiedDocs: Annotation<RetrievedDocument[]>({
     reducer: (_, next) => next,
     default: () => [],
   }),
