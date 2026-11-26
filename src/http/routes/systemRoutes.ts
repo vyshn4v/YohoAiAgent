@@ -25,7 +25,7 @@ function extractAdminToken(req: Request): string {
 }
 
 function requireAdminAuth(req: Request, res: Response, next: NextFunction): void {
-  const configuredKey = process.env.ADMIN_API_KEY || config.adminApiKey;
+  const configuredKey = process.env.ADMIN_API_KEY || '';
   if (!configuredKey) {
     res.status(503).json({ error: 'Admin API key is not configured.' });
     return;

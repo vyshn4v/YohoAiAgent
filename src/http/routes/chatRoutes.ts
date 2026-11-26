@@ -4,7 +4,11 @@ import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { agentGraph } from '../../agent/graph.js';
 import { extractConversationalReply } from '../../agent/utils/messageUtils.js';
 import { createNodeLogger } from '../../utils/nodeLogger.js';
-import { getConversationSession, saveConversationSession } from '../sessionStore.js';
+import {
+  getConversationSession,
+  saveConversationSession,
+  withConversationLock,
+} from '../sessionStore.js';
 import { handleSseChatStream } from '../sseChatHandler.js';
 
 export function createChatRouter(): Router {
@@ -46,50 +50,55 @@ export function createChatRouter(): Router {
         return;
       }
 
-      const session = await getConversationSession(conversationId);
       log = createNodeLogger('Server:Chat', conversationId);
-      log.start({ messageLen: message.length, historyCount: session.messages.length });
 
-      const userMessage = new HumanMessage(message);
-      const updatedHistory = [...session.messages, userMessage];
+      const responsePayload = await withConversationLock(conversationId, async () => {
+        const session = await getConversationSession(conversationId);
+        log!.start({ messageLen: message.length, historyCount: session.messages.length });
 
-      const finalState = await agentGraph.invoke(
-        {
-          messages: updatedHistory,
-          leadInfo: session.leadInfo,
-          isVerified: session.isVerified,
-        },
-        {
-          runName: 'PortfolioAgentChat',
-          configurable: { thread_id: conversationId },
-          metadata: { conversationId, session_id: conversationId },
-        }
-      );
+        const userMessage = new HumanMessage(message);
+        const updatedHistory = [...session.messages, userMessage];
 
-      const lastAiMsg = finalState.messages[finalState.messages.length - 1];
-      const replyText = extractConversationalReply(lastAiMsg.content);
+        const finalState = await agentGraph.invoke(
+          {
+            messages: updatedHistory,
+            leadInfo: session.leadInfo,
+            isVerified: session.isVerified,
+          },
+          {
+            runName: 'PortfolioAgentChat',
+            configurable: { thread_id: conversationId },
+            metadata: { conversationId, session_id: conversationId },
+          }
+        );
 
-      const mergedLeadInfo = { ...session.leadInfo, ...(finalState.leadInfo || {}) };
-      const finalIsVerified = Boolean(finalState.isVerified ?? session.isVerified);
-      await saveConversationSession(
-        conversationId,
-        [...updatedHistory, new AIMessage(replyText)],
-        mergedLeadInfo,
-        finalIsVerified
-      );
+        const lastAiMsg = finalState.messages[finalState.messages.length - 1];
+        const replyText = extractConversationalReply(lastAiMsg.content);
 
-      const uiAction = finalState.uiAction || null;
-      const retrievedCount = finalState.retrievedDocs?.length || 0;
-      log.done({ intent: finalState.intent, retrievedCount, replyLen: replyText.length });
+        const mergedLeadInfo = { ...session.leadInfo, ...(finalState.leadInfo || {}) };
+        const finalIsVerified = Boolean(finalState.isVerified ?? session.isVerified);
+        await saveConversationSession(
+          conversationId,
+          [...updatedHistory, new AIMessage(replyText)],
+          mergedLeadInfo,
+          finalIsVerified
+        );
 
-      res.json({
-        reply: replyText,
-        conversationId,
-        intent: finalState.intent,
-        leadInfo: mergedLeadInfo,
-        uiAction,
-        retrievedCount,
+        const uiAction = finalState.uiAction || null;
+        const retrievedCount = finalState.retrievedDocs?.length || 0;
+        log!.done({ intent: finalState.intent, retrievedCount, replyLen: replyText.length });
+
+        return {
+          reply: replyText,
+          conversationId,
+          intent: finalState.intent,
+          leadInfo: mergedLeadInfo,
+          uiAction,
+          retrievedCount,
+        };
       });
+
+      res.json(responsePayload);
     } catch (error: any) {
       if (log) {
         log.fail(error);

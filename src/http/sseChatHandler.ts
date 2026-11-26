@@ -5,7 +5,11 @@ import type { LeadInfo } from '../agent/state.js';
 import { extractConversationalReply } from '../agent/utils/messageUtils.js';
 import { createNodeLogger } from '../utils/nodeLogger.js';
 import { applySseCorsHeaders } from './corsConfig.js';
-import { getConversationSession, saveConversationSession } from './sessionStore.js';
+import {
+  getConversationSession,
+  saveConversationSession,
+  withConversationLock,
+} from './sessionStore.js';
 
 const NODE_STATUS_MAP: Record<string, string> = {
   decision_router: 'understanding_query',
@@ -55,94 +59,99 @@ export async function handleSseChatStream(
   let activeNode = 'graph_init';
 
   try {
-    const session = await getConversationSession(conversationId);
-    log.start({ messageLen: message.length, historyCount: session.messages.length });
     sendEvent('status', { status: 'starting', conversationId });
 
-    const userMessage = new HumanMessage(message);
-    const updatedHistory = [...session.messages, userMessage];
+    await withConversationLock(conversationId, async () => {
+      if (isClientDisconnected) return;
 
-    let fullReply = '';
-    let intent = 'profile_query';
-    let finalLeadInfo: LeadInfo = { ...session.leadInfo };
-    let finalIsVerified = session.isVerified;
-    let finalUiAction: Record<string, any> | null = null;
+      const session = await getConversationSession(conversationId);
+      log.start({ messageLen: message.length, historyCount: session.messages.length });
 
-    const stream = agentGraph.streamEvents(
-      {
-        messages: updatedHistory,
-        leadInfo: session.leadInfo,
-        isVerified: session.isVerified,
-      },
-      {
-        version: 'v2',
-        runName: 'PortfolioAgentChat',
-        configurable: { thread_id: conversationId },
-        metadata: { conversationId, session_id: conversationId },
-      }
-    );
+      const userMessage = new HumanMessage(message);
+      const updatedHistory = [...session.messages, userMessage];
 
-    for await (const event of stream) {
-      if (isClientDisconnected) {
-        log.warn('Client disconnected mid-stream', { activeNode });
-        break;
-      }
+      let fullReply = '';
+      let intent = 'profile_query';
+      let finalLeadInfo: LeadInfo = { ...session.leadInfo };
+      let finalIsVerified = session.isVerified;
+      let finalUiAction: Record<string, any> | null = null;
 
-      const node = event.metadata?.langgraph_node;
-      if (event.event === 'on_chain_start' && node) {
-        activeNode = node;
-        const mappedStatus = NODE_STATUS_MAP[node];
-        if (mappedStatus) {
-          sendEvent('status', { node, status: mappedStatus });
+      const stream = agentGraph.streamEvents(
+        {
+          messages: updatedHistory,
+          leadInfo: session.leadInfo,
+          isVerified: session.isVerified,
+        },
+        {
+          version: 'v2',
+          runName: 'PortfolioAgentChat',
+          configurable: { thread_id: conversationId },
+          metadata: { conversationId, session_id: conversationId },
         }
-      }
-
-      if (event.event === 'on_chain_end' && event.name === 'LangGraph') {
-        const finalState = event.data.output;
-        if (finalState?.intent) intent = finalState.intent;
-        if (finalState?.leadInfo) finalLeadInfo = { ...finalLeadInfo, ...finalState.leadInfo };
-        if (typeof finalState?.isVerified === 'boolean') finalIsVerified = finalState.isVerified;
-        if (finalState?.uiAction !== undefined) finalUiAction = finalState.uiAction;
-        if (finalState?.messages?.length > 0) {
-          const lastMsg = finalState.messages[finalState.messages.length - 1];
-          fullReply = extractConversationalReply(lastMsg.content);
-        }
-      }
-    }
-
-    if (fullReply && !isClientDisconnected) {
-      for (const word of fullReply.split(/(\s+)/)) {
-        if (isClientDisconnected) break;
-        sendEvent('token', { token: word, conversationId });
-      }
-    }
-
-    // Avoid saving empty AIMessage("") turns when client disconnects before completion
-    if (!isClientDisconnected && fullReply) {
-      await saveConversationSession(
-        conversationId,
-        [...updatedHistory, new AIMessage(fullReply)],
-        finalLeadInfo,
-        finalIsVerified
       );
-    }
 
-    if (!isClientDisconnected) {
-      if (finalUiAction) sendEvent('ui_action', finalUiAction);
-      sendEvent('done', {
-        conversationId,
-        reply: fullReply,
+      for await (const event of stream) {
+        if (isClientDisconnected) {
+          log.warn('Client disconnected mid-stream', { activeNode });
+          break;
+        }
+
+        const node = event.metadata?.langgraph_node;
+        if (event.event === 'on_chain_start' && node) {
+          activeNode = node;
+          const mappedStatus = NODE_STATUS_MAP[node];
+          if (mappedStatus) {
+            sendEvent('status', { node, status: mappedStatus });
+          }
+        }
+
+        if (event.event === 'on_chain_end' && event.name === 'LangGraph') {
+          const finalState = event.data.output;
+          if (finalState?.intent) intent = finalState.intent;
+          if (finalState?.leadInfo) finalLeadInfo = { ...finalLeadInfo, ...finalState.leadInfo };
+          if (typeof finalState?.isVerified === 'boolean') finalIsVerified = finalState.isVerified;
+          if (finalState?.uiAction !== undefined) finalUiAction = finalState.uiAction;
+          if (finalState?.messages?.length > 0) {
+            const lastMsg = finalState.messages[finalState.messages.length - 1];
+            fullReply = extractConversationalReply(lastMsg.content);
+          }
+        }
+      }
+
+      if (fullReply && !isClientDisconnected) {
+        for (const word of fullReply.split(/(\s+)/)) {
+          if (isClientDisconnected) break;
+          sendEvent('token', { token: word, conversationId });
+        }
+      }
+
+      // Avoid saving empty AIMessage("") turns when client disconnects before completion
+      if (!isClientDisconnected && fullReply) {
+        await saveConversationSession(
+          conversationId,
+          [...updatedHistory, new AIMessage(fullReply)],
+          finalLeadInfo,
+          finalIsVerified
+        );
+      }
+
+      if (!isClientDisconnected) {
+        if (finalUiAction) sendEvent('ui_action', finalUiAction);
+        sendEvent('done', {
+          conversationId,
+          reply: fullReply,
+          intent,
+          leadInfo: finalLeadInfo,
+          uiAction: finalUiAction,
+        });
+      }
+
+      log.done({
         intent,
-        leadInfo: finalLeadInfo,
-        uiAction: finalUiAction,
+        replyLen: fullReply.length,
+        hasUiAction: Boolean(finalUiAction),
+        ...(isClientDisconnected ? { disconnected: true, activeNode } : {}),
       });
-    }
-
-    log.done({
-      intent,
-      replyLen: fullReply.length,
-      hasUiAction: Boolean(finalUiAction),
-      ...(isClientDisconnected ? { disconnected: true, activeNode } : {}),
     });
   } catch (err: any) {
     log.fail(err, { activeNode });

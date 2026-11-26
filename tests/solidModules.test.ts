@@ -11,6 +11,7 @@ import {
   clearConversationSessions,
   getConversationSession,
   saveConversationSession,
+  withConversationLock,
 } from '../src/http/sessionStore.js';
 import {
   buildLeadNotificationEmail,
@@ -103,6 +104,70 @@ describe('SOLID Module Unit Tests', () => {
       const loaded = await getConversationSession('sess-fallback');
       expect(loaded.messages).toHaveLength(1);
       expect(loaded.leadInfo.name).toBe('Bob');
+    });
+
+    it('serializes concurrent turns for the same conversationId with Redis lock and Lua release', async () => {
+      const redisMap = new Map<string, string>();
+      vi.spyOn(redisClient, 'get').mockImplementation(async (key: any) => redisMap.get(key) ?? null);
+      vi.spyOn(redisClient, 'set').mockImplementation(async (key: any, val: any, ...args: any[]) => {
+        if (args.includes('NX')) {
+          if (redisMap.has(key)) return null;
+          redisMap.set(key, String(val));
+          return 'OK' as any;
+        }
+        redisMap.set(key, String(val));
+        return 'OK' as any;
+      });
+      const evalSpy = vi
+        .spyOn(redisClient, 'eval')
+        .mockImplementation(async (_script: any, _numKeys: any, key: any, token: any) => {
+          if (redisMap.get(key) === token) {
+            redisMap.delete(key);
+            return 1 as any;
+          }
+          return 0 as any;
+        });
+
+      const order: string[] = [];
+      await Promise.all([
+        withConversationLock('conv-lock', async () => {
+          order.push('t1-start');
+          await new Promise((r) => setTimeout(r, 30));
+          await saveConversationSession('conv-lock', [new HumanMessage('turn-1')], { name: 'A' });
+          order.push('t1-end');
+        }),
+        withConversationLock('conv-lock', async () => {
+          order.push('t2-start');
+          const session = await getConversationSession('conv-lock');
+          expect(session.messages).toHaveLength(1);
+          expect(session.messages[0].content).toBe('turn-1');
+          order.push('t2-end');
+        }),
+      ]);
+
+      expect(order).toEqual(['t1-start', 't1-end', 't2-start', 't2-end']);
+      expect(evalSpy).toHaveBeenCalledTimes(2);
+      expect(redisMap.has('session_lock:conv-lock')).toBe(false);
+    });
+
+    it('falls back to local lock serialization when Redis lock throws', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(redisClient, 'set').mockRejectedValue(new Error('Redis offline'));
+
+      const order: string[] = [];
+      await Promise.all([
+        withConversationLock('conv-local-lock', async () => {
+          order.push('first-in');
+          await new Promise((r) => setTimeout(r, 25));
+          order.push('first-out');
+        }),
+        withConversationLock('conv-local-lock', async () => {
+          order.push('second-in');
+          order.push('second-out');
+        }),
+      ]);
+
+      expect(order).toEqual(['first-in', 'first-out', 'second-in', 'second-out']);
     });
   });
 

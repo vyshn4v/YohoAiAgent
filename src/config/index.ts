@@ -123,7 +123,6 @@ export const config = {
   },
 
   hostEmail: process.env.HOST_EMAIL || 'vyshnav@example.com',
-  adminApiKey: process.env.ADMIN_API_KEY || '',
 
   langsmith: langsmithConfig,
 

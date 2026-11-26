@@ -9,6 +9,7 @@ import { Server } from 'http';
 describe('Express REST API Endpoints', () => {
   let server: Server;
   let baseUrl: string;
+  const originalAdminApiKey = process.env.ADMIN_API_KEY;
 
   beforeAll(async () => {
     await new Promise<void>((resolve) => {
@@ -21,7 +22,11 @@ describe('Express REST API Endpoints', () => {
   });
 
   afterEach(() => {
-    delete process.env.ADMIN_API_KEY;
+    if (originalAdminApiKey === undefined) {
+      delete process.env.ADMIN_API_KEY;
+    } else {
+      process.env.ADMIN_API_KEY = originalAdminApiKey;
+    }
     vi.restoreAllMocks();
   });
 
