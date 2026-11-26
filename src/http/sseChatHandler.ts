@@ -1,6 +1,6 @@
 import type { Request, Response } from 'express';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
-import { agentGraph } from '../agent/graph.js';
+import { agentGraph, GRAPH_RUN_NAME } from '../agent/graph.js';
 import type { LeadInfo } from '../agent/state.js';
 import { extractConversationalReply } from '../agent/utils/messageUtils.js';
 import { createNodeLogger } from '../utils/nodeLogger.js';
@@ -84,7 +84,7 @@ export async function handleSseChatStream(
         },
         {
           version: 'v2',
-          runName: 'PortfolioAgentChat',
+          runName: GRAPH_RUN_NAME,
           configurable: { thread_id: conversationId },
           metadata: { conversationId, session_id: conversationId },
         }
@@ -105,7 +105,13 @@ export async function handleSseChatStream(
           }
         }
 
-        if (event.event === 'on_chain_end' && event.name === 'LangGraph') {
+        // LangGraph replaces root event.name ('LangGraph') with runName when specified
+        const isRootGraphEnd =
+          event.event === 'on_chain_end' &&
+          !node &&
+          (event.name === GRAPH_RUN_NAME || event.name === 'LangGraph');
+
+        if (isRootGraphEnd) {
           const finalState = event.data.output;
           if (finalState?.intent) intent = finalState.intent;
           if (finalState?.leadInfo) finalLeadInfo = { ...finalLeadInfo, ...finalState.leadInfo };

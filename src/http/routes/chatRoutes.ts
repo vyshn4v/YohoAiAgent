@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
-import { agentGraph } from '../../agent/graph.js';
+import { agentGraph, GRAPH_RUN_NAME } from '../../agent/graph.js';
 import { extractConversationalReply } from '../../agent/utils/messageUtils.js';
 import { createNodeLogger } from '../../utils/nodeLogger.js';
 import {
@@ -66,7 +66,7 @@ export function createChatRouter(): Router {
             isVerified: session.isVerified,
           },
           {
-            runName: 'PortfolioAgentChat',
+            runName: GRAPH_RUN_NAME,
             configurable: { thread_id: conversationId },
             metadata: { conversationId, session_id: conversationId },
           }

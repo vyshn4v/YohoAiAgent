@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { AIMessage } from '@langchain/core/messages';
 import { app } from '../src/server.js';
-import { agentGraph } from '../src/agent/graph.js';
+import { agentGraph, GRAPH_RUN_NAME } from '../src/agent/graph.js';
 import { redisClient } from '../src/services/redisClient.js';
 import * as sessionStore from '../src/http/sessionStore.js';
 import { Server } from 'http';
@@ -86,7 +86,7 @@ describe('Express REST API Endpoints', () => {
     expect(data.error).toBe('Message string is required.');
   });
 
-  it('POST /api/chat/stream should stream SSE tokens with CORS headers', async () => {
+  it('POST /api/chat/stream should stream SSE tokens and non-empty done reply with CORS headers', async () => {
     const res = await fetch(`${baseUrl}/api/chat/stream`, {
       method: 'POST',
       headers: {
@@ -106,12 +106,19 @@ describe('Express REST API Endpoints', () => {
     );
     expect(res.headers.get('cache-control')).toContain('no-cache');
 
-    const reader = res.body?.getReader();
-    expect(reader).toBeDefined();
-    const { value } = await reader!.read();
-    const chunkText = new TextDecoder().decode(value);
-    expect(chunkText).toContain('event: status');
-    await reader?.cancel();
+    const fullText = await res.text();
+    expect(fullText).toContain('event: status');
+    expect(fullText).toContain('event: token');
+    expect(fullText).toContain('event: done');
+
+    const doneMatch = fullText.match(/event: done\ndata: (.+)\n/);
+    expect(doneMatch).toBeTruthy();
+    const donePayload = JSON.parse(doneMatch![1]);
+    expect(donePayload.conversationId).toBe('sse-session-1');
+    expect(typeof donePayload.reply).toBe('string');
+    expect(donePayload.reply.trim().length).toBeGreaterThan(0);
+
+    await redisClient.del('session:sse-session-1');
   });
 
   it('GET /api/chat/stream should stream SSE for native EventSource requests with subdomain CORS', async () => {
@@ -201,7 +208,13 @@ describe('Express REST API Endpoints', () => {
       yield { event: 'on_chain_start', metadata: { langgraph_node: 'decision_router' } } as any;
       yield {
         event: 'on_chain_end',
-        name: 'LangGraph',
+        name: 'decision_router',
+        metadata: { langgraph_node: 'decision_router' },
+        data: { output: { intent: 'schedule_enquiry' } },
+      } as any;
+      yield {
+        event: 'on_chain_end',
+        name: GRAPH_RUN_NAME,
         data: {
           output: {
             intent: 'schedule_enquiry',
@@ -226,6 +239,7 @@ describe('Express REST API Endpoints', () => {
     expect(fullText).toContain('event: token');
     expect(fullText).toContain('event: ui_action');
     expect(fullText).toContain('event: done');
+    expect(fullText).toContain('"reply":"Code sent"');
     expect(saveSpy).toHaveBeenCalledTimes(1);
     expect(saveSpy.mock.calls[0][1][1]).toBeInstanceOf(AIMessage);
   });
@@ -245,7 +259,7 @@ describe('Express REST API Endpoints', () => {
       await new Promise((r) => setTimeout(r, 150));
       yield {
         event: 'on_chain_end',
-        name: 'LangGraph',
+        name: GRAPH_RUN_NAME,
         data: { output: { messages: [new AIMessage('Late reply')] } },
       } as any;
     } as any);

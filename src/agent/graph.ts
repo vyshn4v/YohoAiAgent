@@ -67,5 +67,8 @@ export function buildAgentGraph() {
   return workflow.compile();
 }
 
+// Shared LangGraph run name used for invocation, tracing, and SSE root event matching
+export const GRAPH_RUN_NAME = 'PortfolioAgentChat';
+
 // Pre-compiled agent graph runnable singleton
 export const agentGraph = buildAgentGraph();
