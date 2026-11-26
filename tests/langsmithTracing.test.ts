@@ -49,6 +49,21 @@ describe('LangSmith Tracing Configuration & Traceable Integration', () => {
     expect(mockEnv.LANGSMITH_PROJECT).toBe('custom-project');
   });
 
+  it('derives agent project from LANGSMITH_AGENT_ID and LANGSMITH_AGENT_ENVIRONMENT when project is unset', () => {
+    const mockEnv: Record<string, string | undefined> = {
+      LANGSMITH_API_KEY: 'lsv2_test_key_value',
+      LANGSMITH_TRACING: 'true',
+      LANGSMITH_AGENT_ID: 'mylocalagent',
+      LANGSMITH_AGENT_ENVIRONMENT: 'local',
+    };
+
+    const result = configureLangSmithEnv(mockEnv);
+
+    expect(result.project).toBe('mylocalagent-local');
+    expect(mockEnv.LANGSMITH_PROJECT).toBe('mylocalagent-local');
+    expect(mockEnv.LANGCHAIN_PROJECT).toBe('mylocalagent-local');
+  });
+
   it('executes traceable-wrapped decision, retrieval, and generator nodes cleanly with RunnableConfig', async () => {
     const ai = getGoogleGenAiClient();
     vi.spyOn(ai.decisions, 'create').mockResolvedValueOnce({

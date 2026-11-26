@@ -21,7 +21,15 @@ export function configureLangSmithEnv(env: Record<string, string | undefined> = 
     env.LANGSMITH_TRACING_V2 ||
     env.LANGCHAIN_TRACING_V2 ||
     (apiKey ? 'true' : 'false');
-  const project = env.LANGSMITH_PROJECT || env.LANGCHAIN_PROJECT || 'ai-portfolio-agent';
+  const agentProject =
+    env.LANGSMITH_AGENT_ID && env.LANGSMITH_AGENT_ENVIRONMENT
+      ? `${env.LANGSMITH_AGENT_ID}-${env.LANGSMITH_AGENT_ENVIRONMENT}`
+      : undefined;
+  const project =
+    env.LANGSMITH_PROJECT ||
+    env.LANGCHAIN_PROJECT ||
+    agentProject ||
+    'ai-portfolio-agent';
   const endpoint =
     env.LANGSMITH_ENDPOINT || env.LANGCHAIN_ENDPOINT || 'https://api.smith.langchain.com';
 
