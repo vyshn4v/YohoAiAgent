@@ -97,7 +97,7 @@ function getLastUserMessage(messages: BaseMessage[]): string {
 }
 
 const OUT_OF_SCOPE_REPLY =
-  "I'm Yoho, Vyshnav P C's portfolio assistant. I can only answer questions about Vyshnav's skills, projects, experience, and background, or help schedule a consultation with him.";
+  "Sorry, invalid query. I can only assist with questions about Vyshnav P C's skills, projects, experience, and background, or help schedule a consultation with him.";
 
 type DecisionIntent = 'greeting' | 'schedule_enquiry' | 'knowledge_query' | 'out_of_scope';
 

@@ -118,9 +118,9 @@ describe('Decision AI & 4-Tier Model Routing', () => {
       });
 
       expect(result.intent).toBe('out_of_scope');
-      expect(String(result.messages[result.messages.length - 1].content)).toContain(
-        'Vyshnav P C'
-      );
+      const outOfScopeText = String(result.messages[result.messages.length - 1].content);
+      expect(outOfScopeText).toContain('Sorry, invalid query. I can only assist');
+      expect(outOfScopeText).toContain('Vyshnav P C');
       expect(vectorSpy).not.toHaveBeenCalled();
       expect(llmSpy).not.toHaveBeenCalled();
     });
