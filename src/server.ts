@@ -217,13 +217,15 @@ async function handleSseChatStream(
 
       // Status updates when nodes start
       if (event.event === 'on_chain_start') {
-        if (node === 'first_router_and_ui' || node === 'agent1_keyword_extractor') {
+        if (node === 'decision_router' || node === 'first_router_and_ui' || node === 'agent1_keyword_extractor') {
           sendEvent('status', { node, status: 'understanding_query' });
-        } else if (node === 'second_extractor' || node === 'agent2_relevance_classifier') {
+        } else if (node === 'greeting_small_model') {
+          sendEvent('status', { node, status: 'greeting' });
+        } else if (node === 'pgvector_retriever' || node === 'second_extractor' || node === 'agent2_relevance_classifier') {
           sendEvent('status', { node, status: 'extracting_facts' });
-        } else if (node === 'third_generator' || node === 'agent3_profile_synthesizer') {
+        } else if (node === 'knowledge_big_model' || node === 'third_generator' || node === 'agent3_profile_synthesizer') {
           sendEvent('status', { node, status: 'generating_answer' });
-        } else if (node === 'enquiry_coordinator') {
+        } else if (node === 'schedule_enquiry' || node === 'enquiry_coordinator') {
           sendEvent('status', { node, status: 'processing_enquiry' });
         }
       }

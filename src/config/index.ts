@@ -28,10 +28,14 @@ const resolvedProvider =
     ? 'nvidia'
     : 'openrouter');
 
-const providerConfigs: Record<string, { apiKey: string; model: string; baseUrl: string }> = {
+const providerConfigs: Record<string, { apiKey: string; model: string; baseUrl: string; [key: string]: any }> = {
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || '',
-    model: process.env.GEMINI_MODEL || 'gemini-3.5-flash',
+    decisionModel: process.env.GEMINI_DECISION_MODEL || 'gemini-decision-1',
+    greetingModel: process.env.GEMINI_GREETING_MODEL || 'gemini-flash-lite-latest',
+    bigModel: process.env.GEMINI_BIG_MODEL || 'gemini-flash-latest',
+    embeddingModel: process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2',
+    model: process.env.GEMINI_MODEL || 'gemini-flash-latest',
     baseUrl: process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/',
   },
   groq: {
@@ -110,5 +114,18 @@ export const config = {
 
   cors: {
     origin: process.env.CORS_ORIGIN || '*',
+  },
+
+  postgres: {
+    url: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/portfolio_db',
+    dimension: parseInt(process.env.PGVECTOR_DIMENSION || '768', 10),
+    ssl: process.env.PGSSL === 'true' ? { rejectUnauthorized: false } : undefined,
+  },
+
+  models: {
+    decision: process.env.GEMINI_DECISION_MODEL || 'gemini-decision-1',
+    greeting: process.env.GEMINI_GREETING_MODEL || 'gemini-flash-lite-latest',
+    big: process.env.GEMINI_BIG_MODEL || 'gemini-flash-latest',
+    embedding: process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2',
   },
 };

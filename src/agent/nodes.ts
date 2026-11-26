@@ -3,7 +3,9 @@ import { ChatOpenAI } from '@langchain/openai';
 import { z } from 'zod';
 import { config } from '../config/index.js';
 import { AgentStateType, LeadInfo } from './state.js';
-import { loadProfileData } from '../services/profileLoader.js';
+import { generateTextEmbedding } from '../services/embeddingService.js';
+import { searchResumeChunks } from '../services/pgVectorService.js';
+import { loadProfileSections } from '../services/profileLoader.js';
 import { RetrievedDocument } from '../services/pineconeService.js';
 import {
   sendVerificationOtpTool,
@@ -12,15 +14,19 @@ import {
 } from '../tools/index.js';
 
 /**
- * Creates the LLM ChatOpenAI instance (Google Gemini, Groq, NVIDIA NIM, or OpenRouter)
+ * Creates a ChatOpenAI model instance pointing to the active provider (Gemini, OpenRouter, etc.).
  */
-export function getLlmModel(temperature = 0) {
+function createModelInstance(modelName: string, temperature = 0) {
+  const isGemini = config.llm.provider === 'gemini';
+  const apiKey = isGemini ? config.gemini.apiKey : config.llm.apiKey;
+  const baseUrl = isGemini ? config.gemini.baseUrl : config.llm.baseUrl;
   const isOpenRouter = config.llm.provider === 'openrouter';
+
   return new ChatOpenAI({
-    modelName: config.llm.model,
-    apiKey: config.llm.apiKey || 'mock-key',
+    modelName,
+    apiKey: apiKey || 'mock-key',
     configuration: {
-      baseURL: config.llm.baseUrl,
+      baseURL: baseUrl,
       defaultHeaders: isOpenRouter
         ? {
             'HTTP-Referer': config.openrouter.siteUrl,
@@ -34,7 +40,24 @@ export function getLlmModel(temperature = 0) {
   });
 }
 
-export const getOpenRouterModel = getLlmModel;
+/** 1. Decision AI Model: gemini-decision-1 (Fast intent & query router) */
+export function getDecisionModel(temperature = 0) {
+  return createModelInstance(config.models?.decision || 'gemini-decision-1', temperature);
+}
+
+/** 2. Greeting Small Model: gemini-flash-lite-latest (Instant greetings with zero DB retrieval) */
+export function getGreetingSmallModel(temperature = 0.3) {
+  return createModelInstance(config.models?.greeting || 'gemini-flash-lite-latest', temperature);
+}
+
+/** 3. Knowledge Big Model: gemini-flash-latest (Deep contextual synthesis) */
+export function getKnowledgeBigModel(temperature = 0.2) {
+  return createModelInstance(config.models?.big || 'gemini-flash-latest', temperature);
+}
+
+// Backward compatibility alias
+export const getLlmModel = getKnowledgeBigModel;
+export const getOpenRouterModel = getDecisionModel;
 
 function parseToolOutput(res: any): any {
   const str =
@@ -61,311 +84,113 @@ function getLastUserMessage(messages: BaseMessage[]): string {
   return '';
 }
 
-function formatRecentHistory(messages: BaseMessage[], limit = 4): string {
-  const recent = messages.slice(-limit);
-  return recent
-    .map((m) => {
-      const type = m._getType() === 'human' || m instanceof HumanMessage ? 'User' : 'Assistant';
-      const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-      return `${type}: ${content}`;
-    })
-    .join('\n');
+/**
+ * Decision Node: Direct call to gemini-decision-1 Decision Model (Zero LLM)
+ * If failed, returns error message to user to try again later.
+ */
+async function callDecisionModel(message: string): Promise<'greeting' | 'schedule_enquiry' | 'knowledge_query'> {
+  const apiKey = config.gemini.apiKey || config.llm.apiKey;
+  const modelName = config.models.decision || 'gemini-decision-1';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:createDecision?key=${apiKey}`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      input: message,
+      questions: {
+        intent: {
+          type: 'choice',
+          criteria: {
+            greeting: 'Casual greeting or pleasantry',
+            schedule_enquiry:
+              'Scheduling a meeting or consultation, sharing contact details, or entering an OTP code',
+            knowledge_query:
+              'Questions about technical skills, experience, projects, or resume',
+          },
+        },
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Decision model returned ${response.status}: ${errorText}`);
+  }
+
+  const data: any = await response.json();
+  const choice = data?.decisions?.intent?.choice || data?.intent?.choice;
+  if (!choice) {
+    throw new Error('Decision model returned invalid response');
+  }
+
+  return choice;
 }
 
-const canonicalCategoryMap: Record<string, string> = {
-  personal: 'personal',
-  about: 'personal',
-  bio: 'personal',
-  me: 'personal',
-  intro: 'personal',
-  contact: 'contact',
-  social: 'contact',
-  links: 'contact',
-  email: 'contact',
-  phone: 'contact',
-  reach: 'contact',
-  skills: 'skills',
-  tech: 'skills',
-  stack: 'skills',
-  technologies: 'skills',
-  tools: 'skills',
-  experience: 'experience',
-  work: 'experience',
-  job: 'experience',
-  career: 'experience',
-  employment: 'experience',
-  history: 'experience',
-  neutrinos: 'experience',
-  projects: 'projects',
-  project: 'projects',
-  portfolio: 'projects',
-  work_samples: 'projects',
-  domain_scanner: 'projects',
-  domainscanner: 'projects',
-  yohoaiagent: 'projects',
-  yoho: 'projects',
-  agency: 'agency',
-  lixerlab: 'agency',
-  services: 'agency',
-  company: 'agency',
-  engineeringphilosophy: 'engineeringPhilosophy',
-  philosophy: 'engineeringPhilosophy',
-  principles: 'engineeringPhilosophy',
-  engineering_philosophy: 'engineeringPhilosophy',
-  certifications: 'certifications',
-  certificates: 'certifications',
-  courses: 'certifications',
-  education: 'education',
-  college: 'education',
-  degree: 'education',
-  bootcamp: 'education',
-  brototype: 'education',
-  languages: 'languages',
-  language: 'languages',
-  schedulingpolicy: 'schedulingPolicy',
-  scheduling_policy: 'schedulingPolicy',
-  policy: 'schedulingPolicy',
-  meeting_policy: 'schedulingPolicy',
-  booking_policy: 'schedulingPolicy',
-};
-
-/**
- * Phase 1: Router, Natural Language Extractor & UI Handler (AI Call 1)
- *
- * The AI receives the user's freeform text and extracts any contact details,
- * OTP codes, and intent directly into structured JSON.
- *
- * If it is an informal greeting, general talk, or UI event (contact/OTP/booking),
- * it completes immediately in this phase to prevent downstream AI calls and save tokens.
- *
- * If it is a factual question about Vyshnav's profile, it outputs the target keys
- * from profile.json for in-memory slicing in Phase 2.
- */
-export async function firstRouterAndUiNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+export async function decisionRouterNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const lastMessage = getLastUserMessage(state.messages);
 
+  try {
+    const intent = await callDecisionModel(lastMessage);
+    return {
+      intent: intent === 'knowledge_query' ? 'profile_query' : intent,
+      extractedKeywords: lastMessage,
+    };
+  } catch (err: any) {
+    console.error('[DecisionNode] Error:', err);
+    const errorMessage = 'An error occurred while processing your request. Please try again later.';
+    return {
+      intent: 'direct',
+      finalMessage: errorMessage,
+      messages: [new AIMessage(errorMessage)],
+    };
+  }
+}
 
-    const transcript = state.messages
-      .map(
-        (m) =>
-          `${m._getType() === 'human' ? 'User' : 'Assistant'}: ${
-            typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
-          }`
-      )
+/**
+ * Node: Schedule Enquiry Node
+ * Dedicated Small AI Model extracts contact JSON and manages the OTP & meeting flow.
+ * If failed, returns error message to user to try again later.
+ */
+export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+  const lastMessage = getLastUserMessage(state.messages);
+
+  const contactSchema = z.object({
+    name: z.string().nullable().describe('User full name'),
+    email: z.string().nullable().describe('User email address'),
+    phone: z.string().nullable().describe('User phone number'),
+    reason: z.string().nullable().describe('Reason for consultation'),
+    otp: z.string().nullable().describe('6-digit OTP code'),
+    action: z.enum(['verify_otp', 'schedule', 'send_otp', 'request_info']),
+  });
+
+  try {
+    const smallModel = getGreetingSmallModel(0);
+    const extractor = smallModel.withStructuredOutput(contactSchema);
+    const conversationContext = state.messages
+      .map((m) => `${m._getType() === 'human' ? 'User' : 'Assistant'}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`)
       .join('\n');
+    const extracted = await extractor.invoke(conversationContext || lastMessage);
 
-    const routerSchema = z.object({
-      isUiOrDirect: z
-        .boolean()
-        .describe(
-          "True if user message is an informal greeting, general conversation, or a UI/scheduling/contact event (booking, providing contact info, verifying OTP). False if asking factual questions about Vyshnav's background, education, skills, projects, experience, etc."
-        ),
-      action: z
-        .enum(['none', 'send_otp', 'verify_otp', 'schedule', 'request_info'])
-        .describe(
-          "Action to take: 'send_otp' if both email and name are known and OTP needs to be sent; 'verify_otp' if a 6-digit verification code is provided; 'schedule' if all info is verified and ready to book; 'request_info' if user wants to connect but name or email is missing; 'none' for greetings or profile knowledge queries."
-        ),
-      reply: z
-        .string()
-        .describe(
-          "When isUiOrDirect is true, provide the complete friendly reply to the user as Yoho. (e.g. asking for missing name, greeting them, or giving confirmation). Empty string if isUiOrDirect is false."
-        ),
-      extracted: z
-        .object({
-          name: z.string().nullable().describe('Extracted user full name from user text or previous context, or null'),
-          email: z.string().nullable().describe('Extracted user email from user text or previous context, or null'),
-          phone: z.string().nullable().describe('Extracted phone number from user text or previous context, or null'),
-          reason: z.string().nullable().describe('Extracted reason for meeting/consultation from user text, or null'),
-          otp: z.string().nullable().describe('Extracted 6-digit OTP verification code from user text, or null'),
-        })
-        .describe('Extracted user fields parsed directly by the AI from natural language text'),
-      categories: z
-        .array(z.string())
-        .describe(
-          "List of category keys from profile.json when isUiOrDirect is false. Available keys: ['personal', 'contact', 'skills', 'experience', 'projects', 'agency', 'engineeringPhilosophy', 'certifications', 'education', 'languages', 'schedulingPolicy']."
-        ),
-      resolvedQuestion: z
-        .string()
-        .nullable()
-        .describe(
-          'The user question resolved with explicit subjects using the conversation history (e.g., rewriting pronouns like "it", "they", "that project" into the specific project name such as "What technologies does Domain Scanner use?").'
-        ),
-    });
+    const mergedLeadInfo: LeadInfo = {
+      ...state.leadInfo,
+      ...(extracted.name ? { name: extracted.name } : {}),
+      ...(extracted.email ? { email: extracted.email } : {}),
+      ...(extracted.phone ? { phone: extracted.phone } : {}),
+      ...(extracted.reason ? { reason: extracted.reason } : {}),
+    };
 
-    const llm = getOpenRouterModel(0);
-    const structuredLlm = llm.withStructuredOutput(routerSchema);
+    // 1. Verify OTP if provided
+    if (extracted.otp && (extracted.action === 'verify_otp' || !state.isVerified)) {
+      const emailToVerify = mergedLeadInfo.email || 'user@example.com';
+      const verifyRes = await verifyOtpTool.invoke({
+        email: emailToVerify,
+        otp: extracted.otp,
+      });
+      const parsed = parseToolOutput(verifyRes);
 
-    const systemPrompt = `You are AI Agent 1 (Classifier, Natural Language Extractor & UI Handler) for Vyshnav P C's personal portfolio assistant (Yoho).
-Your role:
-1. Read the user's natural language input and extract all user details (name, email, phone, reason, 6-digit OTP) into the "extracted" object.
-   - If prior context already has their name or email, preserve it.
-2. Determine if the message is:
-   A) An opening greeting ("hi", "hello", "hey", "who are you"):
-      isUiOrDirect: true, action: "none", reply: friendly opening greeting introducing yourself as Yoho.
-   B) Mid-conversation acknowledgements or casual follow-ups ("okay", "ok", "cool", "thanks", "got it", "sure", "alright", "great"):
-      - DO NOT re-introduce yourself or repeat "Hey there! I'm Yoho".
-      - Instead, acknowledge naturally and contextually (e.g. "Sounds good! What would you like to explore next about Vyshnav's projects, tech stack, or would you like to schedule a consultation?").
-      - isUiOrDirect: true, action: "none".
-   C) A request to connect, meet, schedule, or consultation:
-      - If user provides email but Name is missing:
-        isUiOrDirect: true, action: "request_info", reply: ask politely for their name before dispatching the code, mentioning Vyshnav replies within 24 hours.
-      - If BOTH Name and Email are available:
-        isUiOrDirect: true, action: "send_otp".
-      - If user entered a 6-digit OTP code:
-        isUiOrDirect: true, action: "verify_otp".
-      - If Name or Email is missing entirely:
-        isUiOrDirect: true, action: "request_info", reply: invite them to share their Name and Email address, mentioning that Vyshnav personally replies within 24 hours.
-   D) A factual question about Vyshnav P C (skills, projects, work experience, education, certifications):
-      isUiOrDirect: false, action: "none", categories: matching keys from profile.json (e.g. ["education"], ["skills", "experience"], ["projects"]). Questions about specific projects (Domain Scanner, YohoAiAgent, etc.) must include "projects".
-3. In resolvedQuestion, rewrite the user query to make the subject explicit using prior conversation context (e.g., resolving "What technologies does it use?" into "What technologies does Domain Scanner use?").`;
-
-    const result = await structuredLlm.invoke([
-      new SystemMessage(systemPrompt),
-      new HumanMessage(
-        `CONVERSATION TRANSCRIPT:\n${transcript}\n\nEXISTING LEAD INFO:\n${JSON.stringify(
-          state.leadInfo || {}
-        )}\n\nLATEST USER QUERY:\n${lastMessage}`
-      ),
-    ]);
-
-    if (result.isUiOrDirect) {
-      const mergedLeadInfo: LeadInfo = {
-        ...state.leadInfo,
-        ...(result.extracted?.name ? { name: result.extracted.name } : {}),
-        ...(result.extracted?.email ? { email: result.extracted.email } : {}),
-        ...(result.extracted?.phone ? { phone: result.extracted.phone } : {}),
-        ...(result.extracted?.reason ? { reason: result.extracted.reason } : {}),
-      };
-
-      // 1. Verify OTP
-      if (result.action === 'verify_otp' && result.extracted?.otp) {
-        const emailToVerify = mergedLeadInfo.email || 'user@example.com';
-        const verifyRes = await verifyOtpTool.invoke({
-          email: emailToVerify,
-          otp: result.extracted.otp,
-        });
-        const parsed = parseToolOutput(verifyRes);
-
-        if (parsed.status !== 'verified') {
-          const replyMsg = `Verification failed: ${parsed.message || 'Invalid code.'} Please check your 6-digit code and try again.`;
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            messages: [new AIMessage(replyMsg)],
-            uiAction: parsed.uiAction ?? null,
-          };
-        }
-
-        // Email verified successfully - collect any missing details before invoking scheduleEnquiryTool
-        if (!mergedLeadInfo.name) {
-          const replyMsg = `Your email has been successfully verified! ✅ Could you please provide your full name so I can finalize your consultation booking?`;
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            isVerified: true,
-            messages: [new AIMessage(replyMsg)],
-            uiAction: null,
-          };
-        }
-
-        // Invoke scheduleEnquiryTool before ending the graph
-        const scheduleRes = await scheduleEnquiryTool.invoke({
-          name: mergedLeadInfo.name,
-          email: emailToVerify,
-          phone: mergedLeadInfo.phone || 'Not provided',
-          reason: mergedLeadInfo.reason || 'General portfolio consultation / enquiry',
-        });
-        const scheduleParsed = parseToolOutput(scheduleRes);
-
-        if (scheduleParsed.status === 'confirmed') {
-          const replyMsg = `Your email has been successfully verified! ✅ Vyshnav will review your details and get in touch within 24 hours. 🚀`;
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            isVerified: true,
-            messages: [new AIMessage(replyMsg)],
-            uiAction: null,
-          };
-        } else {
-          const replyMsg = `Your email was verified, but we were unable to finalize your consultation: ${scheduleParsed.message || 'Please try again.'}`;
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            isVerified: true,
-            messages: [new AIMessage(replyMsg)],
-            uiAction: null,
-          };
-        }
-      }
-
-      // 2. Schedule action
-      if (result.action === 'schedule') {
-        if (!mergedLeadInfo.name || !mergedLeadInfo.email) {
-          const missing = !mergedLeadInfo.name && !mergedLeadInfo.email ? 'Name and Email address' : !mergedLeadInfo.name ? 'full name' : 'email address';
-          const replyMsg = `To schedule your consultation, please share your ${missing}. Vyshnav personally reviews all requests and replies within 24 hours!`;
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            messages: [new AIMessage(replyMsg)],
-            uiAction: null,
-          };
-        }
-
-        const scheduleRes = await scheduleEnquiryTool.invoke({
-          name: mergedLeadInfo.name,
-          email: mergedLeadInfo.email,
-          phone: mergedLeadInfo.phone || 'Not provided',
-          reason: mergedLeadInfo.reason || 'General portfolio consultation / enquiry',
-        });
-        const scheduleParsed = parseToolOutput(scheduleRes);
-
-        if (scheduleParsed.status === 'confirmed') {
-          const replyMsg = `Your consultation is confirmed! ✅ Vyshnav will review your details and personally get in touch within 24 hours. 🚀`;
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            isVerified: true,
-            messages: [new AIMessage(replyMsg)],
-            uiAction: null,
-          };
-        } else if (scheduleParsed.status === 'unverified') {
-          const otpRes = await sendVerificationOtpTool.invoke({
-            email: mergedLeadInfo.email,
-            name: mergedLeadInfo.name,
-          });
-          const otpParsed = parseToolOutput(otpRes);
-          const isSent = otpParsed.status === 'sent';
-          const replyMsg = isSent
-            ? `A 6-digit verification code has been dispatched to ${mergedLeadInfo.email}! 🔐 Please enter the code here to confirm your request. Vyshnav personally replies within 24 hours!`
-            : `We encountered an issue sending the verification code to ${mergedLeadInfo.email}: ${otpParsed.message || 'Delivery error'}. Please try again.`;
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            messages: [new AIMessage(replyMsg)],
-            uiAction: otpParsed.uiAction ?? null,
-          };
-        } else {
-          return {
-            intent: 'schedule_enquiry',
-            leadInfo: mergedLeadInfo,
-            messages: [new AIMessage(`Could not complete your enquiry: ${scheduleParsed.message}`)],
-            uiAction: null,
-          };
-        }
-      }
-
-      // 3. Send OTP (only when both name and email are present)
-      if (result.action === 'send_otp' && mergedLeadInfo.email && mergedLeadInfo.name) {
-        const otpRes = await sendVerificationOtpTool.invoke({
-          email: mergedLeadInfo.email,
-          name: mergedLeadInfo.name,
-        });
-        const parsed = parseToolOutput(otpRes);
-        const isSuccess = parsed.status === 'sent';
-        const replyMsg = isSuccess
-          ? `A 6-digit verification code has been dispatched to ${mergedLeadInfo.email}! 🔐 Please enter the 6-digit verification code here to confirm your request. Vyshnav personally replies within 24 hours!`
-          : `We encountered an issue sending the verification code to ${mergedLeadInfo.email}: ${parsed.message || 'Delivery failed'}. Please check your email address and try again.`;
-
+      if (parsed.status !== 'verified') {
+        const replyMsg = `Verification failed: ${parsed.message || 'Invalid code.'} Please check your code and try again.`;
         return {
           intent: 'schedule_enquiry',
           leadInfo: mergedLeadInfo,
@@ -374,150 +199,247 @@ Your role:
         };
       }
 
-      // 4. Request info or greeting response
-      let finalReply =
-        result.reply ||
-        "I'd love to help you connect with Vyshnav! Please share your Name and Email address so I can send an OTP to verify your request.";
-      if (result.action === 'request_info' && !finalReply.toLowerCase().includes('24 hours')) {
-        finalReply += ' Vyshnav personally reviews all requests and replies within 24 hours! 🚀';
+      if (!mergedLeadInfo.name) {
+        return {
+          intent: 'schedule_enquiry',
+          leadInfo: mergedLeadInfo,
+          isVerified: true,
+          messages: [new AIMessage('Your email has been successfully verified! ✅ Please share your full name to finalize the booking.')],
+          uiAction: null,
+        };
       }
 
+      const scheduleRes = await scheduleEnquiryTool.invoke({
+        name: mergedLeadInfo.name,
+        email: emailToVerify,
+        phone: mergedLeadInfo.phone || 'Not provided',
+        reason: mergedLeadInfo.reason || 'General portfolio consultation / enquiry',
+      });
+      const scheduleParsed = parseToolOutput(scheduleRes);
+
+      const replyMsg =
+        scheduleParsed.status === 'confirmed'
+          ? 'Your email has been successfully verified! ✅ Vyshnav will review your details and reach out within 24 hours.'
+          : `Unable to finalize consultation: ${scheduleParsed.message || 'Please try again later.'}`;
+
       return {
-        intent: result.action === 'none' ? 'general_chat' : 'schedule_enquiry',
+        intent: 'schedule_enquiry',
         leadInfo: mergedLeadInfo,
-        messages: [new AIMessage(finalReply)],
+        isVerified: true,
+        messages: [new AIMessage(replyMsg)],
+        uiAction: null,
       };
     }
 
-  // Knowledge query: passes category keys and resolved question to Phase 2
+    // 2. Require both name and email before dispatching OTP or scheduling
+    if (!mergedLeadInfo.name || !mergedLeadInfo.email) {
+      const replyMsg = !mergedLeadInfo.name && !mergedLeadInfo.email
+        ? 'Please share your name and email address to schedule a consultation. Vyshnav reviews all requests within 24 hours.'
+        : !mergedLeadInfo.name
+        ? 'Could you please share your name as well? Vyshnav personally replies within 24 hours.'
+        : 'Please share your email address so I can send a verification code.';
+
+      return {
+        intent: 'schedule_enquiry',
+        leadInfo: mergedLeadInfo,
+        messages: [new AIMessage(replyMsg)],
+        uiAction: null,
+      };
+    }
+
+    // 3. Name and email available: attempt scheduling or dispatch verification OTP if unverified
+    const scheduleRes = await scheduleEnquiryTool.invoke({
+      name: mergedLeadInfo.name,
+      email: mergedLeadInfo.email,
+      phone: mergedLeadInfo.phone || 'Not provided',
+      reason: mergedLeadInfo.reason || 'General consultation',
+    });
+    const scheduleParsed = parseToolOutput(scheduleRes);
+
+    if (scheduleParsed.status === 'confirmed') {
+      return {
+        intent: 'schedule_enquiry',
+        leadInfo: mergedLeadInfo,
+        isVerified: true,
+        messages: [new AIMessage('Your consultation is confirmed! ✅ Vyshnav will review your details and reach out within 24 hours.')],
+        uiAction: null,
+      };
+    }
+
+    if (scheduleParsed.status === 'unverified') {
+      const otpRes = await sendVerificationOtpTool.invoke({
+        email: mergedLeadInfo.email,
+        name: mergedLeadInfo.name,
+      });
+      const otpParsed = parseToolOutput(otpRes);
+      const isSent = otpParsed.status === 'sent';
+      const replyMsg = isSent
+        ? `A 6-digit verification code has been dispatched to ${mergedLeadInfo.email}! 🔐 Please enter the code here to confirm. Vyshnav personally replies within 24 hours!`
+        : `Failed to send verification code to ${mergedLeadInfo.email}. Please try again later.`;
+
+      return {
+        intent: 'schedule_enquiry',
+        leadInfo: mergedLeadInfo,
+        messages: [new AIMessage(replyMsg)],
+        uiAction: otpParsed.uiAction ?? null,
+      };
+    }
+
+    return {
+      intent: 'schedule_enquiry',
+      leadInfo: mergedLeadInfo,
+      messages: [new AIMessage(`Unable to finalize consultation: ${scheduleParsed.message || 'Please try again later.'}`)],
+      uiAction: null,
+    };
+  } catch (err: any) {
+    console.error('[ScheduleEnquiry] Error:', err);
+    const errorMessage = 'An error occurred while processing your scheduling request. Please try again later.';
+    return {
+      intent: 'schedule_enquiry',
+      finalMessage: errorMessage,
+      messages: [new AIMessage(errorMessage)],
+    };
+  }
+}
+
+async function invokeModelWith404Fallback(
+  model: ChatOpenAI,
+  fallbackModelName: string,
+  temperature: number,
+  messages: BaseMessage[]
+) {
+  try {
+    return await model.invoke(messages);
+  } catch (err: any) {
+    if (err?.status === 404 || err?.lc_error_code === 'MODEL_NOT_FOUND') {
+      const fallback = createModelInstance(fallbackModelName, temperature);
+      return await fallback.invoke(messages);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Node 2: Greeting Node (Small Model: gemini-flash-lite-latest)
+ * Sends back an instant, friendly greeting with ZERO database lookup.
+ */
+export async function greetingSmallModelNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+  const lastMessage = getLastUserMessage(state.messages);
+
+  const greetingSystemPrompt = `You are Yoho, the AI portfolio assistant for Vyshnav P C (Full-Stack & AI Engineer).
+Reply warmly in 1-2 short sentences; mention you can share Vyshnav's skills, projects, experience, or help schedule a meeting.`;
+
+  const response = await invokeModelWith404Fallback(
+    getGreetingSmallModel(0.3),
+    'gemini-flash-latest',
+    0.3,
+    [new SystemMessage(greetingSystemPrompt), new HumanMessage(lastMessage || 'Hello')]
+  );
+
+  const replyText = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+
   return {
-    intent: 'profile_query',
-    categories:
-      result.categories && result.categories.length > 0 ? result.categories : ['personal', 'skills'],
-    extractedKeywords: result.resolvedQuestion || lastMessage,
+    finalMessage: replyText,
+    messages: [new AIMessage(replyText)],
+    uiAction: null,
   };
 }
 
 /**
- * Phase 2: In-Memory Data Slicing & Fact Extraction (AI Call 2)
- *
- * Loops through the category keys returned by Phase 1 and extracts ONLY those
- * sections from profile.json.
- *
- * Sends user question + sliced data to AI Call 2 to strictly extract relevant facts.
+ * Node 3: PostgreSQL Vector Retriever Node
+ * Embeds query keywords using gemini-embedding-2 and retrieves top matching chunks from pgvector.
  */
-export async function secondExtractorNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  const lastUserQuery = getLastUserMessage(state.messages);
-  const resolvedQuery = state.extractedKeywords || lastUserQuery;
-  const conversationContext = formatRecentHistory(state.messages);
-  const categories =
-    state.categories && state.categories.length > 0 ? state.categories : ['personal', 'skills'];
+export async function pgVectorRetrieverNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+  const query = state.extractedKeywords || getLastUserMessage(state.messages);
 
-  // In-Memory Slicing from profile.json (0 AI tokens spent on slicing)
-  const profile = loadProfileData();
-  const slicedData: Record<string, any> = {};
+  let retrievedDocs: RetrievedDocument[] = [];
 
-  for (const cat of categories) {
-    const normalized = cat.toLowerCase().trim().replace(/[^a-z0-9_]/g, '');
-    const canonicalKey = canonicalCategoryMap[normalized] || (cat.toLowerCase().trim() === 'about' ? 'personal' : cat.trim());
-    if ((profile as any)[canonicalKey]) {
-      slicedData[canonicalKey] = (profile as any)[canonicalKey];
+  try {
+    // Generate query embedding via gemini-embedding-2
+    const queryEmbedding = await generateTextEmbedding(query);
+
+    // Query PostgreSQL resume_chunks table via cosine distance
+    const pgChunks = await searchResumeChunks(queryEmbedding, 4);
+
+    if (pgChunks && pgChunks.length > 0) {
+      retrievedDocs = pgChunks.map((c) => ({
+        id: c.id,
+        score: c.similarity ?? 0.85,
+        text: `### ${c.title}\n${c.content}`,
+        metadata: c.metadata,
+      }));
+    }
+  } catch (err: any) {
+    console.warn(`[PgVectorRetriever] Vector search exception: ${err.message}`);
+  }
+
+  // Exception handling fallback (Rule 3): if PostgreSQL has no chunks or is offline,
+  // seamlessly fall back to local profile sections so queries never fail!
+  if (retrievedDocs.length === 0) {
+    try {
+      const sections = loadProfileSections();
+      const queryLower = query.toLowerCase();
+      const scored = sections.map((sec, idx) => {
+        let score = 0.4;
+        const terms = queryLower.split(/\s+/).filter((t) => t.length > 2);
+        for (const term of terms) {
+          if (sec.text.toLowerCase().includes(term)) score += 0.2;
+        }
+        return {
+          id: sec.id || `chunk-fallback-${idx}`,
+          score: Math.min(score, 0.95),
+          text: `### ${sec.title}\n${sec.text.trim()}`,
+          metadata: sec.metadata || {},
+        };
+      });
+      scored.sort((a, b) => b.score - a.score);
+      retrievedDocs = scored.slice(0, 4);
+    } catch {
+      // Local fallback failed, proceed with empty docs
     }
   }
 
-  // If a category cannot be resolved, recover before invoking the extractor rather than passing an empty slice
-  if (Object.keys(slicedData).length === 0) {
-    slicedData.personal = profile.personal;
-    slicedData.skills = profile.skills;
-    slicedData.projects = profile.projects;
-  }
-
-  // Keep the complete projects slice available to both extraction and generation stages
-  if (!slicedData.projects && profile.projects) {
-    slicedData.projects = profile.projects;
-  }
-
-  // Synthesize retrievedDocs from sliced keys for test compatibility
-  const retrievedDocs: RetrievedDocument[] = Object.entries(slicedData).map(([k, v], i) => ({
-    id: `slice-${k}`,
-    score: 0.95 - i * 0.05,
-    text: typeof v === 'string' ? v : JSON.stringify(v, null, 2),
-    metadata: { category: k },
-  }));
-
-  const extractorSchema = z.object({
-    relevantFacts: z
-      .array(z.string())
-      .describe(
-        'List of precise, factual bullet points strictly answering the user query from the provided JSON slice.'
-      ),
-    found: z.boolean().describe('True if relevant data was found in the sliced JSON; false otherwise.'),
-  });
-
-  const llm = getOpenRouterModel(0);
-  const structuredLlm = llm.withStructuredOutput(extractorSchema);
-
-  const systemPrompt = `You are AI Agent 2 (Targeted Fact Extractor) for Vyshnav P C's portfolio.
-You are given conversation context, the resolved user question, and a filtered slice of profile.json.
-Your job is to read the provided JSON slice and extract ONLY the facts that directly answer the user's question, preserving any subject or context from previous turns.
-Return strict JSON with relevantFacts and found.`;
-
-  const result = await structuredLlm.invoke([
-    new SystemMessage(systemPrompt),
-    new HumanMessage(
-      `RECENT CONVERSATION CONTEXT:\n${conversationContext}\n\nUSER QUESTION (RESOLVED):\n"${resolvedQuery}"\n\nSLICED PROFILE DATA (JSON):\n${JSON.stringify(slicedData, null, 2)}`
-    ),
-  ]);
-
   return {
-    slicedData,
-    relevantFacts: result.relevantFacts || [],
     retrievedDocs,
-    extractedKeywords: resolvedQuery,
+    classifiedDocs: retrievedDocs,
   };
 }
 
 /**
- * Phase 3: Final Response Synthesizer (AI Call 3)
- * Synthesizes the extracted facts into a polished, natural answer from Yoho.
+ * Node 4: Knowledge Node (Big Model: gemini-flash-latest)
+ * Synthesizes grounded, accurate, professional answers as Yoho using the retrieved chunks.
  */
-export async function thirdGeneratorNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  const lastUserQuery = getLastUserMessage(state.messages);
-  const resolvedQuery = state.extractedKeywords || lastUserQuery;
-  const conversationContext = formatRecentHistory(state.messages);
-  const facts = state.relevantFacts || [];
-  const factsText = facts.join('\n- ');
+export async function bigModelKnowledgeNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+  const lastMessage = getLastUserMessage(state.messages);
 
-  const llm = getOpenRouterModel(0.2);
+  const contextText =
+    (state.retrievedDocs || [])
+      .map((d, i) => `[Source ${i + 1}]:\n${d.text}`)
+      .join('\n\n') || 'Vyshnav P C is a Full-Stack & AI Engineer specialized in LangGraph, TypeScript, Python, and Node.js.';
 
-  const systemPrompt = `You are Yoho, Vyshnav P C's personal AI portfolio assistant.
-Your task is to answer the user's question directly and thoroughly using ONLY the provided verified facts.
+  const knowledgeSystemPrompt = `You are Yoho, AI assistant for Vyshnav P C (Full-Stack & AI Engineer).
+Answer concisely and professionally using ONLY the resume context below. Highlight concrete skills and results. If missing, state what is known and offer a call.
 
-STRICT RULES:
-1. ONLY use the facts provided in the input. DO NOT add any outside or additional information of your own.
-2. Answer the question directly and completely. Never return only an intro or teaser—always include all relevant facts.
-3. Output clean, readable plain text with standard bullet points (-) and helpful emojis (👋, 🚀, 💻, 🤖, ✨).
-4. NEVER use any HTML tags under any circumstances (NO <br>, NO <table>, NO <tr>, NO <td>, NO <p>, NO <div>, NO <span>). Use normal line breaks and bullet points only.
-5. DO NOT add any concluding summaries, commentary, wrap-up statements, or tips at the end (NO "Summary:", NO "Tip:", NO "This experience showcases..."). Deliver the factual answer directly and stop immediately.`;
+CONTEXT:
+${contextText}`;
 
-  const response = await llm.invoke([
-    new SystemMessage(systemPrompt),
-    new HumanMessage(
-      `RECENT CONVERSATION CONTEXT:\n${conversationContext}\n\nUSER QUESTION (RESOLVED):\n"${resolvedQuery}"\n\nDATA FROM AI 2 (VERIFIED FACTS):\n- ${factsText}`
-    ),
-  ]);
+  const response = await invokeModelWith404Fallback(
+    getKnowledgeBigModel(0.2),
+    'gemini-flash-latest',
+    0.2,
+    [new SystemMessage(knowledgeSystemPrompt), new HumanMessage(lastMessage)]
+  );
 
-  const finalMessage = typeof response.content === 'string' ? response.content.trim() : JSON.stringify(response.content);
+  const replyText = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
 
   return {
-    finalMessage,
-    messages: [new AIMessage(finalMessage)],
+    finalMessage: replyText,
+    messages: [new AIMessage(replyText)],
+    uiAction: null,
   };
 }
 
-// Backwards-compatibility aliases for existing imports
-export const agent1KeywordExtractor = firstRouterAndUiNode;
-export const agent2RelevanceClassifier = secondExtractorNode;
-export const agent3ProfileSynthesizer = thirdGeneratorNode;
-export const pineconeRetrievalNode = async (state: AgentStateType) => ({ retrievedDocs: state.retrievedDocs });
-export const enquiryCoordinatorNode = firstRouterAndUiNode;
+// Backward compatibility node aliases
+export const firstRouterAndUiNode = decisionRouterNode;
+export const secondExtractorNode = pgVectorRetrieverNode;
+export const thirdGeneratorNode = bigModelKnowledgeNode;
