@@ -3,10 +3,8 @@ import { traceable } from 'langsmith/traceable';
 import { config } from '../../config/index.js';
 import { generateTextEmbedding } from '../../services/embeddingService.js';
 import { searchResumeChunks } from '../../services/pgVectorService.js';
-import { RetrievedDocument } from '../../services/pineconeService.js';
-import { loadProfileSections } from '../../services/profileLoader.js';
 import { createNodeLogger, formatErrorDetails } from '../../utils/nodeLogger.js';
-import { AgentStateType } from '../state.js';
+import { AgentStateType, RetrievedDocument } from '../state.js';
 import { getLastUserMessage, invokeTraceable } from '../utils/messageUtils.js';
 
 const tracedGenerateQueryEmbedding = traceable(
@@ -31,8 +29,7 @@ const tracedSearchResumeChunks = traceable(
 
 /**
  * Node 3: PostgreSQL Vector Retriever Node
- * Embeds query keywords and retrieves top matching chunks from pgvector,
- * falling back to local profile sections if pgvector is empty or offline.
+ * Embeds query keywords and retrieves top matching chunks strictly from PostgreSQL pgvector.
  */
 export async function pgVectorRetrieverNode(
   state: AgentStateType,
@@ -47,7 +44,7 @@ export async function pgVectorRetrieverNode(
   });
 
   let retrievedDocs: RetrievedDocument[] = [];
-  let docSource: 'pgvector' | 'local_fallback' | 'empty' = 'empty';
+  let docSource: 'pgvector' | 'empty' = 'empty';
 
   try {
     log.step('Generating embedding and querying pgvector', { embeddingModel, topK: 4 });
@@ -64,44 +61,12 @@ export async function pgVectorRetrieverNode(
       docSource = 'pgvector';
       log.step('pgvector search returned matches', { count: retrievedDocs.length });
     } else {
-      log.warn('pgvector returned 0 chunks; falling back to local profile sections');
+      log.warn('pgvector returned 0 chunks');
     }
   } catch (err: any) {
-    log.warn('Vector search exception; falling back to local profile sections', {
+    log.warn('Vector search exception; returning empty context', {
       error: formatErrorDetails(err),
     });
-  }
-
-  if (retrievedDocs.length === 0) {
-    try {
-      const sections = loadProfileSections();
-      const terms = query
-        .toLowerCase()
-        .split(/\s+/)
-        .filter((t) => t.length > 2);
-      const scored = sections.map((sec, idx) => {
-        let score = 0.4;
-        const lowerText = sec.text.toLowerCase();
-        for (const term of terms) {
-          if (lowerText.includes(term)) score += 0.2;
-        }
-        return {
-          id: sec.id || `chunk-fallback-${idx}`,
-          score: Math.min(score, 0.95),
-          text: `### ${sec.title}\n${sec.text.trim()}`,
-          metadata: sec.metadata || {},
-        };
-      });
-      scored.sort((a, b) => b.score - a.score);
-      retrievedDocs = scored.slice(0, 4);
-      docSource = retrievedDocs.length > 0 ? 'local_fallback' : 'empty';
-      log.step('Local profile fallback completed', {
-        sectionsScanned: sections.length,
-        docsSelected: retrievedDocs.length,
-      });
-    } catch (fallbackErr: any) {
-      log.fail(fallbackErr, { step: 'local_profile_fallback', docs: 0 });
-    }
   }
 
   log.done({ source: docSource, docs: retrievedDocs.length });

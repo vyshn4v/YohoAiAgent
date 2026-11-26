@@ -8,7 +8,6 @@ import {
   isEmailVerified,
 } from '../services/otpService.js';
 import { enqueueOtpEmail, enqueueLeadNotification } from '../queues/emailQueue.js';
-import { queryPinecone } from '../services/pineconeService.js';
 import { redisClient } from '../services/redisClient.js';
 import { createNodeLogger } from '../utils/nodeLogger.js';
 
@@ -182,39 +181,8 @@ export const scheduleEnquiryTool = tool(
   }
 );
 
-/**
- * Tool 4: search_pinecone
- * Vector search retrieval tool for profile, skills, experience, and services.
- */
-export const searchPineconeTool = tool(
-  async ({ query }) => {
-    const log = createNodeLogger('Tool:search_pinecone');
-    log.start({ queryLen: query.length });
-
-    try {
-      const docs = await queryPinecone(query, 4);
-      log.done({ docs: docs.length });
-      return JSON.stringify(docs);
-    } catch (error: any) {
-      log.fail(error);
-      return JSON.stringify({
-        error: `Search error: ${error.message}`,
-      });
-    }
-  },
-  {
-    name: 'search_pinecone',
-    description:
-      'Searches the Pinecone knowledge base for Vyshnav P C’s job details, technical skills, projects, experience, and contact policies.',
-    schema: z.object({
-      query: z.string().describe('The search query or keywords to look up in the profile.'),
-    }),
-  }
-);
-
 export const agentTools = [
   sendVerificationOtpTool,
   verifyOtpTool,
   scheduleEnquiryTool,
-  searchPineconeTool,
 ];

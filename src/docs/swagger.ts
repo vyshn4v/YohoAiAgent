@@ -4,12 +4,12 @@ export const swaggerDocument = {
     title: 'Yoho - Portfolio AI Agent API',
     version: '1.0.0',
     description:
-      'Backend API for Yoho, Vyshnav P C’s personal AI portfolio and scheduling agent built with LangGraph, OpenRouter, Pinecone, BullMQ, and Redis.\n\n' +
+      'Backend API for Yoho, Vyshnav P C’s personal AI portfolio and scheduling agent built with LangGraph, Gemini, PostgreSQL pgvector, BullMQ, and Redis.\n\n' +
       '### Key Features:\n' +
-      '- **Multi-Agent RAG**: 3-agent pipeline for profile Q&A strictly without web search.\n' +
+      '- **Multi-Agent RAG**: 4-tier pipeline using Gemini Decision AI, small/big models, and PostgreSQL pgvector.\n' +
       '- **Lead Booking & Email Verification**: Captures meeting requests (`name`, `email`, `phone`, `reason`), verifies email via encrypted OTP in Redis & BullMQ, and guarantees response within 24 hours.\n' +
       '- **Interactive Generative UI (`uiAction`)**: Emits inline OTP and form action payloads for seamless in-chat widgets.\n' +
-      '- **Knowledge Ingestion**: Indexes markdown resume/profile into Pinecone.',
+      '- **Knowledge Ingestion**: Indexes resume PDF chunks into PostgreSQL pgvector.',
     contact: {
       name: 'Vyshnav P C',
       email: 'vyshnav@example.com',
@@ -222,7 +222,7 @@ export const swaggerDocument = {
       get: {
         tags: ['System Health'],
         summary: 'Check system health and connected services',
-        description: 'Returns the connection status of Redis, OpenRouter, and Pinecone.',
+        description: 'Returns the connection status of Redis, pgvector, OpenRouter, and LangSmith.',
         responses: {
           '200': {
             description: 'Health status response',
@@ -237,18 +237,18 @@ export const swaggerDocument = {
                       type: 'object',
                       properties: {
                         redis: { type: 'string', example: 'connected' },
+                        pgvector: {
+                          type: 'object',
+                          properties: {
+                            configured: { type: 'boolean', example: true },
+                            dimension: { type: 'integer', example: 768 },
+                          },
+                        },
                         openrouter: {
                           type: 'object',
                           properties: {
                             configured: { type: 'boolean', example: true },
                             model: { type: 'string', example: 'openai/gpt-4o-mini' },
-                          },
-                        },
-                        pinecone: {
-                          type: 'object',
-                          properties: {
-                            configured: { type: 'boolean', example: true },
-                            index: { type: 'string', example: 'portfolio-agent' },
                           },
                         },
                       },
@@ -265,9 +265,9 @@ export const swaggerDocument = {
     '/api/ingest': {
       post: {
         tags: ['Knowledge Base'],
-        summary: 'Index profile document into Pinecone',
+        summary: 'Index resume PDF into PostgreSQL pgvector',
         description:
-          'Reads `src/data/profile.md`, chunks the text into semantic sections, generates vector embeddings, and upserts them into the Pinecone index.',
+          'Reads the resume PDF, chunks the text into semantic sections, generates vector embeddings, and atomically replaces rows in the `resume_chunks` pgvector table.',
         responses: {
           '200': {
             description: 'Ingestion results',
@@ -278,7 +278,7 @@ export const swaggerDocument = {
                   properties: {
                     success: { type: 'boolean', example: true },
                     count: { type: 'integer', example: 5 },
-                    message: { type: 'string', example: 'Successfully indexed 5 profile chunks into Pinecone.' },
+                    message: { type: 'string', example: 'Successfully parsed resume.pdf and updated 5 chunk(s) in PostgreSQL pgvector.' },
                   },
                 },
               },

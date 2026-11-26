@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import swaggerUi from 'swagger-ui-express';
 import { config } from '../../config/index.js';
 import { swaggerDocument } from '../../docs/swagger.js';
-import { ingestProfileData } from '../../scripts/ingest.js';
+import { ingestResumePdf } from '../../scripts/ingestResumePdf.js';
 import { redisClient } from '../../services/redisClient.js';
 
 export function createSystemRouter(): Router {
@@ -27,9 +27,6 @@ export function createSystemRouter(): Router {
       }
     }
 
-    const pineconeConfigured = Boolean(
-      config.pinecone.apiKey && config.pinecone.apiKey !== 'your_pinecone_api_key_here'
-    );
     const openrouterConfigured = Boolean(
       config.openrouter.apiKey && config.openrouter.apiKey !== 'your_openrouter_api_key_here'
     );
@@ -39,13 +36,13 @@ export function createSystemRouter(): Router {
       timestamp: new Date().toISOString(),
       services: {
         redis: redisStatus,
+        pgvector: {
+          configured: Boolean(config.postgres.url),
+          dimension: config.postgres.dimension,
+        },
         openrouter: {
           configured: openrouterConfigured,
           model: config.openrouter.model,
-        },
-        pinecone: {
-          configured: pineconeConfigured,
-          index: config.pinecone.indexName,
         },
         langsmith: {
           configured: Boolean(config.langsmith.apiKey),
@@ -58,7 +55,7 @@ export function createSystemRouter(): Router {
 
   router.post('/api/ingest', async (_req: Request, res: Response) => {
     try {
-      const result = await ingestProfileData();
+      const result = await ingestResumePdf();
       res.json(result);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

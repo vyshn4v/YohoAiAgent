@@ -2,14 +2,13 @@
   "name": "ai-portfolio-agent",
   "version": "1.0.0",
   "type": "module",
-  "description": "Multi-Agent Backend using LangGraph, OpenRouter, Pinecone, BullMQ, and Redis",
+  "description": "Multi-Agent Backend using LangGraph, Gemini, pgvector, BullMQ, and Redis",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "worker": "tsx src/workers/emailWorker.ts",
-    "ingest": "tsx src/scripts/ingest.ts",
     "test:chat": "tsx src/scripts/cliChat.ts",
     "ingest:pdf": "tsx src/scripts/ingestResumePdf.ts",
     "test": "vitest run --no-file-parallelism"
@@ -17,8 +16,8 @@
   "keywords": [
     "langgraph",
     "ai-agent",
-    "openrouter",
-    "pinecone",
+    "gemini",
+    "pgvector",
     "bullmq",
     "redis"
   ],
@@ -29,7 +28,6 @@
     "@langchain/core": "^0.3.40",
     "@langchain/langgraph": "^0.2.54",
     "@langchain/openai": "^0.4.4",
-    "@pinecone-database/pinecone": "^5.0.2",
     "bullmq": "^5.41.6",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",

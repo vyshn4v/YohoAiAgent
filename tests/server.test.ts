@@ -57,8 +57,8 @@ describe('Express REST API Endpoints', () => {
     expect(data.status).toBe('healthy');
     expect(data.services).toBeDefined();
     expect(data.services.redis).toBeDefined();
+    expect(data.services.pgvector).toBeDefined();
     expect(data.services.openrouter).toBeDefined();
-    expect(data.services.pinecone).toBeDefined();
   });
 
   it('POST /api/chat should validate missing message body', async () => {

@@ -61,7 +61,7 @@ describe('Decision AI & 4-Tier Model Routing', () => {
       expect(result.retrievedDocs![0].text).toContain('LangGraph');
     });
 
-    it('should fall back gracefully to local profile sections when pgvector is empty', async () => {
+    it('should handle empty pgvector results gracefully without crashing', async () => {
       vi.spyOn(pgVectorService, 'searchResumeChunks').mockResolvedValue([]);
 
       const state = {
@@ -71,8 +71,7 @@ describe('Decision AI & 4-Tier Model Routing', () => {
 
       const result = await pgVectorRetrieverNode(state as any);
 
-      expect(result.retrievedDocs).toBeDefined();
-      expect(result.retrievedDocs!.length).toBeGreaterThan(0);
+      expect(result.retrievedDocs).toEqual([]);
     });
   });
 

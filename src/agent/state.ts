@@ -1,6 +1,12 @@
 import { Annotation, messagesStateReducer } from '@langchain/langgraph';
 import { BaseMessage } from '@langchain/core/messages';
-import { RetrievedDocument } from '../services/pineconeService.js';
+
+export interface RetrievedDocument {
+  id: string;
+  score: number;
+  text: string;
+  metadata?: Record<string, any>;
+}
 
 export interface LeadInfo {
   name?: string;

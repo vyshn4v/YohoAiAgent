@@ -113,13 +113,6 @@ export const config = {
     baseUrl: 'https://openrouter.ai/api/v1',
   },
 
-  pinecone: {
-    apiKey: process.env.PINECONE_API_KEY || '',
-    indexName: process.env.PINECONE_INDEX_NAME || 'portfolio-agent',
-    dimension: parseInt(process.env.PINECONE_EMBEDDING_DIMENSION || '1536', 10),
-    namespace: process.env.PINECONE_NAMESPACE || 'default',
-  },
-
   redis: {
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379', 10),

@@ -32,7 +32,7 @@ if (process.env.NODE_ENV !== 'test') {
     console.log(`📡 Endpoints:`);
     console.log(`   - POST /api/chat     (Send message to LangGraph agent)`);
     console.log(`   - GET  /api/health   (Check service connections)`);
-    console.log(`   - POST /api/ingest   (Index profile to Pinecone)`);
+    console.log(`   - POST /api/ingest   (Index resume PDF to pgvector)`);
     console.log(`   - GET  /api/enquiries(View scheduled leads)`);
     console.log(`=======================================================`);
   });
