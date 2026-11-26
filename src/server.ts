@@ -11,6 +11,7 @@ import { startEmailWorker } from './workers/emailWorker.js';
 import { ingestProfileData } from './scripts/ingest.js';
 import { getPineconeClient } from './services/pineconeService.js';
 import { swaggerDocument } from './docs/swagger.js';
+import { createNodeLogger } from './utils/nodeLogger.js';
 
 export const app = express();
 
@@ -192,10 +193,14 @@ async function handleSseChatStream(
     clearInterval(heartbeat);
   });
 
+  const log = createNodeLogger('Server:SSE', conversationId);
+  let activeNode = 'graph_init';
+
   try {
+    const session = getConversationSession(conversationId);
+    log.start({ messageLen: message.length, historyCount: session.messages.length });
     sendEvent('status', { status: 'starting', conversationId });
 
-    const session = getConversationSession(conversationId);
     const userMessage = new HumanMessage(message);
     const updatedHistory = [...session.messages, userMessage];
 
@@ -207,16 +212,22 @@ async function handleSseChatStream(
 
     const stream = agentGraph.streamEvents(
       { messages: updatedHistory, leadInfo: session.leadInfo },
-      { version: 'v2' }
+      { version: 'v2', configurable: { thread_id: conversationId } }
     );
 
     for await (const event of stream) {
-      if (isClientDisconnected) break;
+      if (isClientDisconnected) {
+        log.warn('Client disconnected mid-stream', { activeNode });
+        break;
+      }
 
       const node = event.metadata?.langgraph_node;
 
       // Status updates when nodes start
       if (event.event === 'on_chain_start') {
+        if (node) {
+          activeNode = node;
+        }
         if (node === 'decision_router' || node === 'first_router_and_ui' || node === 'agent1_keyword_extractor') {
           sendEvent('status', { node, status: 'understanding_query' });
         } else if (node === 'greeting_small_model') {
@@ -293,8 +304,14 @@ async function handleSseChatStream(
       leadInfo: finalLeadInfo,
       uiAction: finalUiAction,
     });
+    log.done({
+      intent,
+      replyLen: fullReply.length,
+      hasUiAction: Boolean(finalUiAction),
+      ...(isClientDisconnected ? { disconnected: true, activeNode } : {}),
+    });
   } catch (err: any) {
-    console.error('[SSE Stream Error]', err);
+    log.fail(err, { activeNode });
     if (!isClientDisconnected && !res.writableEnded) {
       sendEvent('error', {
         error:
@@ -347,6 +364,7 @@ app.get('/api/chat/stream', async (req: Request, res: Response): Promise<void> =
  * Body: { message: string, conversationId?: string }
  */
 app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
+  let log: ReturnType<typeof createNodeLogger> | undefined;
   try {
     const { message, conversationId = uuidv4() } = req.body;
 
@@ -363,14 +381,20 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
 
     // Standard JSON response
     const session = getConversationSession(conversationId);
+    log = createNodeLogger('Server:Chat', conversationId);
+    log.start({ messageLen: message.length, historyCount: session.messages.length });
+
     const userMessage = new HumanMessage(message);
     const updatedHistory = [...session.messages, userMessage];
 
     // Execute LangGraph multi-agent pipeline
-    const finalState = await agentGraph.invoke({
-      messages: updatedHistory,
-      leadInfo: session.leadInfo,
-    });
+    const finalState = await agentGraph.invoke(
+      {
+        messages: updatedHistory,
+        leadInfo: session.leadInfo,
+      },
+      { configurable: { thread_id: conversationId } }
+    );
 
     const lastAiMsg = finalState.messages[finalState.messages.length - 1];
     let replyText =
@@ -398,6 +422,8 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
     );
 
     const uiAction = finalState.uiAction || null;
+    const retrievedCount = finalState.classifiedDocs?.length || finalState.retrievedDocs?.length || 0;
+    log.done({ intent: finalState.intent, retrievedCount, replyLen: replyText.length });
 
     res.json({
       reply: replyText,
@@ -405,10 +431,14 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
       intent: finalState.intent,
       leadInfo: mergedLeadInfo,
       uiAction,
-      retrievedCount: finalState.classifiedDocs?.length || finalState.retrievedDocs?.length || 0,
+      retrievedCount,
     });
   } catch (error: any) {
-    console.error('[API Chat Error]', error);
+    if (log) {
+      log.fail(error);
+    } else {
+      console.error('[API Chat Error]', error);
+    }
     res.status(500).json({
       error: 'An error occurred while processing your request.',
       ...(process.env.NODE_ENV === 'development' ? { details: error.message } : {}),

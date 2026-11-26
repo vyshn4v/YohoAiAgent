@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { config } from '../config/index.js';
+import { createNodeLogger } from '../utils/nodeLogger.js';
 
 let openAiEmbeddingClient: OpenAI | null = null;
 
@@ -47,6 +48,7 @@ export async function generateTextEmbedding(text: string): Promise<number[]> {
   const isMockKey = !apiKey || apiKey.includes('your_') || apiKey.includes('placeholder') || apiKey === 'mock-key';
 
   if (!isMockKey && process.env.NODE_ENV !== 'test') {
+    const log = createNodeLogger('EmbeddingService');
     const client = getEmbeddingClient();
     const candidateModels = [
       config.models.embedding || 'gemini-embedding-2',
@@ -67,12 +69,15 @@ export async function generateTextEmbedding(text: string): Promise<number[]> {
         }
       } catch (err: any) {
         if (err?.status === 404) {
+          log.warn('Embedding model returned 404; trying next candidate', { model });
           continue; // Try next candidate
         }
-        console.warn(`[EmbeddingService] Embedding API call (${model}) failed: ${err.message}.`);
+        log.fail(err, { model });
         break;
       }
     }
+
+    log.warn('Using deterministic fallback embedding vector');
   }
 
   return generateDeterministicEmbedding(cleanText, dimension);

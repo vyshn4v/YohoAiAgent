@@ -10,6 +10,7 @@ import {
 import { enqueueOtpEmail, enqueueLeadNotification } from '../queues/emailQueue.js';
 import { queryPinecone } from '../services/pineconeService.js';
 import { redisClient } from '../services/redisClient.js';
+import { createNodeLogger } from '../utils/nodeLogger.js';
 
 /**
  * Tool 1: send_verification_otp
@@ -18,11 +19,15 @@ import { redisClient } from '../services/redisClient.js';
  */
 export const sendVerificationOtpTool = tool(
   async ({ email, name }) => {
+    const log = createNodeLogger('Tool:send_verification_otp');
+    log.start({ hasName: Boolean(name) });
+
     try {
       const otp = generateOtp();
       await storeHashedOtp(email, otp);
-      await enqueueOtpEmail(email, otp, name);
+      const jobId = await enqueueOtpEmail(email, otp, name);
 
+      log.done({ status: 'sent', jobId });
       return JSON.stringify({
         status: 'sent',
         message: `A 6-digit verification code has been dispatched to ${email}. Please enter the code to verify your email. (Note: Valid for 5 minutes).`,
@@ -36,6 +41,7 @@ export const sendVerificationOtpTool = tool(
         },
       });
     } catch (error: any) {
+      log.fail(error);
       return JSON.stringify({
         status: 'error',
         message: `Failed to dispatch verification OTP: ${error.message}`,
@@ -59,10 +65,20 @@ export const sendVerificationOtpTool = tool(
  */
 export const verifyOtpTool = tool(
   async ({ email, otp }) => {
+    const log = createNodeLogger('Tool:verify_otp');
+    log.start({ otpLength: otp.trim().length });
+
     try {
       const result = await verifyEnteredOtp(email, otp);
+      const status = result.success ? 'verified' : 'failed';
+      if (result.success) {
+        log.done({ status });
+      } else {
+        log.warn('OTP verification did not match', { status });
+      }
+
       return JSON.stringify({
-        status: result.success ? 'verified' : 'failed',
+        status,
         message: result.message,
         uiAction: result.success
           ? null
@@ -75,6 +91,7 @@ export const verifyOtpTool = tool(
             },
       });
     } catch (error: any) {
+      log.fail(error);
       return JSON.stringify({
         status: 'error',
         message: `Error during OTP verification: ${error.message}`,
@@ -99,9 +116,13 @@ export const verifyOtpTool = tool(
  */
 export const scheduleEnquiryTool = tool(
   async ({ name, email, phone, reason }) => {
+    const log = createNodeLogger('Tool:schedule_enquiry');
+    log.start({ hasName: Boolean(name), hasPhone: Boolean(phone), reasonLen: reason.length });
+
     try {
       const verified = await isEmailVerified(email);
       if (!verified) {
+        log.done({ status: 'unverified' });
         return JSON.stringify({
           status: 'unverified',
           message: `Email ${email} has not been verified yet. Please request a verification OTP and verify your email before scheduling the meeting.`,
@@ -133,6 +154,7 @@ export const scheduleEnquiryTool = tool(
       // Enqueue notification email to host via BullMQ
       await enqueueLeadNotification({ name, email, phone, reason });
 
+      log.done({ status: 'confirmed', enquiryId });
       return JSON.stringify({
         status: 'confirmed',
         enquiryId,
@@ -140,6 +162,7 @@ export const scheduleEnquiryTool = tool(
         uiAction: null,
       });
     } catch (error: any) {
+      log.fail(error);
       return JSON.stringify({
         status: 'error',
         message: `Failed to schedule enquiry: ${error.message}`,
@@ -165,10 +188,15 @@ export const scheduleEnquiryTool = tool(
  */
 export const searchPineconeTool = tool(
   async ({ query }) => {
+    const log = createNodeLogger('Tool:search_pinecone');
+    log.start({ queryLen: query.length });
+
     try {
       const docs = await queryPinecone(query, 4);
+      log.done({ docs: docs.length });
       return JSON.stringify(docs);
     } catch (error: any) {
+      log.fail(error);
       return JSON.stringify({
         error: `Search error: ${error.message}`,
       });

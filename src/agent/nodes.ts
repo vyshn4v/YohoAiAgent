@@ -1,4 +1,5 @@
 import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import { ChatOpenAI } from '@langchain/openai';
 import { GoogleGenAI } from '@google/genai';
 import { z } from 'zod';
@@ -8,6 +9,7 @@ import { generateTextEmbedding } from '../services/embeddingService.js';
 import { searchResumeChunks } from '../services/pgVectorService.js';
 import { loadProfileSections } from '../services/profileLoader.js';
 import { RetrievedDocument } from '../services/pineconeService.js';
+import { createNodeLogger, formatErrorDetails, NodeLogger } from '../utils/nodeLogger.js';
 import {
   sendVerificationOtpTool,
   verifyOtpTool,
@@ -60,9 +62,9 @@ export function getGreetingSmallModel(temperature = 0.3) {
   return createModelInstance(config.models?.greeting || 'gemini-flash-lite-latest', temperature);
 }
 
-/** 2. Knowledge Big Model: gemini-flash-latest (Deep contextual synthesis) */
+/** 2. Knowledge Big Model: gemini-3.5-flash-lite (Deep contextual synthesis) */
 export function getKnowledgeBigModel(temperature = 0.2) {
-  return createModelInstance(config.models?.big || 'gemini-flash-latest', temperature);
+  return createModelInstance(config.models?.big || 'gemini-3.5-flash-lite', temperature);
 }
 
 // Backward compatibility alias
@@ -129,17 +131,36 @@ async function callDecisionModel(message: string): Promise<'greeting' | 'schedul
   return choice;
 }
 
-export async function decisionRouterNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+export async function decisionRouterNode(
+  state: AgentStateType,
+  runConfig?: RunnableConfig
+): Promise<Partial<AgentStateType>> {
   const lastMessage = getLastUserMessage(state.messages);
+  const modelName = config.models.decision || 'gemini-decision-1';
+  const log = createNodeLogger('DecisionRouter', runConfig);
+  log.start({
+    model: modelName,
+    messageLen: lastMessage.length,
+    historyCount: state.messages.length,
+  });
 
   try {
     const intent = await callDecisionModel(lastMessage);
+    const mappedIntent = intent === 'knowledge_query' ? 'profile_query' : intent;
+    const nextNode =
+      mappedIntent === 'greeting'
+        ? 'greeting_small_model'
+        : mappedIntent === 'schedule_enquiry'
+        ? 'schedule_enquiry'
+        : 'pgvector_retriever';
+
+    log.done({ intent: mappedIntent, rawChoice: intent, nextNode });
     return {
-      intent: intent === 'knowledge_query' ? 'profile_query' : intent,
+      intent: mappedIntent,
       extractedKeywords: lastMessage,
     };
   } catch (err: any) {
-    console.error('[DecisionNode] Error:', err);
+    log.fail(err, { step: 'call_decision_model', model: modelName, fallbackIntent: 'direct' });
     const errorMessage = 'An error occurred while processing your request. Please try again later.';
     return {
       intent: 'direct',
@@ -154,8 +175,20 @@ export async function decisionRouterNode(state: AgentStateType): Promise<Partial
  * Dedicated Small AI Model extracts contact JSON and manages the OTP & meeting flow.
  * If failed, returns error message to user to try again later.
  */
-export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+export async function scheduleEnquiryNode(
+  state: AgentStateType,
+  runConfig?: RunnableConfig
+): Promise<Partial<AgentStateType>> {
   const lastMessage = getLastUserMessage(state.messages);
+  const modelName = config.models?.greeting || 'gemini-flash-lite-latest';
+  const log = createNodeLogger('ScheduleEnquiry', runConfig);
+  let currentStep = 'init';
+
+  log.start({
+    model: modelName,
+    historyCount: state.messages.length,
+    isVerified: Boolean(state.isVerified),
+  });
 
   const contactSchema = z.object({
     name: z.string().nullable().describe('User full name'),
@@ -167,6 +200,8 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
   });
 
   try {
+    currentStep = 'extract_contact_fields';
+    log.step('Extracting contact details and action', { model: modelName });
     const smallModel = getGreetingSmallModel(0);
     const extractor = smallModel.withStructuredOutput(contactSchema);
     const conversationContext = state.messages
@@ -182,8 +217,19 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
       ...(extracted.reason ? { reason: extracted.reason } : {}),
     };
 
+    log.step('Extracted scheduling fields', {
+      action: extracted.action,
+      hasName: Boolean(mergedLeadInfo.name),
+      hasEmail: Boolean(mergedLeadInfo.email),
+      hasPhone: Boolean(mergedLeadInfo.phone),
+      hasReason: Boolean(mergedLeadInfo.reason),
+      hasOtp: Boolean(extracted.otp),
+    });
+
     // 1. Verify OTP if provided
     if (extracted.otp && (extracted.action === 'verify_otp' || !state.isVerified)) {
+      currentStep = 'verify_otp_tool';
+      log.step('Verifying submitted OTP', { hasLeadEmail: Boolean(mergedLeadInfo.email) });
       const emailToVerify = mergedLeadInfo.email || 'user@example.com';
       const verifyRes = await verifyOtpTool.invoke({
         email: emailToVerify,
@@ -192,6 +238,8 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
       const parsed = parseToolOutput(verifyRes);
 
       if (parsed.status !== 'verified') {
+        log.warn('OTP verification rejected', { status: parsed.status });
+        log.done({ outcome: 'otp_verification_failed' });
         const replyMsg = `Verification failed: ${parsed.message || 'Invalid code.'} Please check your code and try again.`;
         return {
           intent: 'schedule_enquiry',
@@ -202,6 +250,7 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
       }
 
       if (!mergedLeadInfo.name) {
+        log.done({ outcome: 'otp_verified_missing_name', isVerified: true });
         return {
           intent: 'schedule_enquiry',
           leadInfo: mergedLeadInfo,
@@ -211,6 +260,8 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
         };
       }
 
+      currentStep = 'schedule_enquiry_after_otp';
+      log.step('OTP verified; finalizing enquiry booking');
       const scheduleRes = await scheduleEnquiryTool.invoke({
         name: mergedLeadInfo.name,
         email: emailToVerify,
@@ -218,6 +269,15 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
         reason: mergedLeadInfo.reason || 'General portfolio consultation / enquiry',
       });
       const scheduleParsed = parseToolOutput(scheduleRes);
+
+      if (scheduleParsed.status !== 'confirmed') {
+        log.warn('Enquiry booking after OTP did not confirm', { status: scheduleParsed.status });
+      }
+      log.done({
+        outcome: scheduleParsed.status === 'confirmed' ? 'booking_confirmed' : 'booking_failed',
+        status: scheduleParsed.status,
+        isVerified: true,
+      });
 
       const replyMsg =
         scheduleParsed.status === 'confirmed'
@@ -235,6 +295,11 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
 
     // 2. Require both name and email before dispatching OTP or scheduling
     if (!mergedLeadInfo.name || !mergedLeadInfo.email) {
+      log.done({
+        outcome: 'missing_required_fields',
+        hasName: Boolean(mergedLeadInfo.name),
+        hasEmail: Boolean(mergedLeadInfo.email),
+      });
       const replyMsg = !mergedLeadInfo.name && !mergedLeadInfo.email
         ? 'Please share your name and email address to schedule a consultation. Vyshnav reviews all requests within 24 hours.'
         : !mergedLeadInfo.name
@@ -250,6 +315,8 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
     }
 
     // 3. Name and email available: attempt scheduling or dispatch verification OTP if unverified
+    currentStep = 'schedule_enquiry_tool';
+    log.step('Checking verification and scheduling enquiry');
     const scheduleRes = await scheduleEnquiryTool.invoke({
       name: mergedLeadInfo.name,
       email: mergedLeadInfo.email,
@@ -259,6 +326,7 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
     const scheduleParsed = parseToolOutput(scheduleRes);
 
     if (scheduleParsed.status === 'confirmed') {
+      log.done({ outcome: 'booking_confirmed', isVerified: true });
       return {
         intent: 'schedule_enquiry',
         leadInfo: mergedLeadInfo,
@@ -269,12 +337,18 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
     }
 
     if (scheduleParsed.status === 'unverified') {
+      currentStep = 'send_verification_otp_tool';
+      log.step('Email unverified; dispatching verification OTP');
       const otpRes = await sendVerificationOtpTool.invoke({
         email: mergedLeadInfo.email,
         name: mergedLeadInfo.name,
       });
       const otpParsed = parseToolOutput(otpRes);
       const isSent = otpParsed.status === 'sent';
+      if (!isSent) {
+        log.warn('Verification OTP dispatch failed', { status: otpParsed.status });
+      }
+      log.done({ outcome: isSent ? 'otp_dispatched' : 'otp_dispatch_failed', status: otpParsed.status });
       const replyMsg = isSent
         ? `A 6-digit verification code has been dispatched to ${mergedLeadInfo.email}! 🔐 Please enter the code here to confirm. Vyshnav personally replies within 24 hours!`
         : `Failed to send verification code to ${mergedLeadInfo.email}. Please try again later.`;
@@ -287,6 +361,8 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
       };
     }
 
+    log.warn('schedule_enquiry returned unexpected status', { status: scheduleParsed.status });
+    log.done({ outcome: 'booking_not_confirmed', status: scheduleParsed.status });
     return {
       intent: 'schedule_enquiry',
       leadInfo: mergedLeadInfo,
@@ -294,7 +370,7 @@ export async function scheduleEnquiryNode(state: AgentStateType): Promise<Partia
       uiAction: null,
     };
   } catch (err: any) {
-    console.error('[ScheduleEnquiry] Error:', err);
+    log.fail(err, { step: currentStep, model: modelName });
     const errorMessage = 'An error occurred while processing your scheduling request. Please try again later.';
     return {
       intent: 'schedule_enquiry',
@@ -308,12 +384,16 @@ async function invokeModelWith404Fallback(
   model: ChatOpenAI,
   fallbackModelName: string,
   temperature: number,
-  messages: BaseMessage[]
+  messages: BaseMessage[],
+  log?: NodeLogger
 ) {
   try {
     return await model.invoke(messages);
   } catch (err: any) {
     if (err?.status === 404 || err?.lc_error_code === 'MODEL_NOT_FOUND') {
+      log?.warn('Primary model returned 404/MODEL_NOT_FOUND; falling back', {
+        fallbackModel: fallbackModelName,
+      });
       const fallback = createModelInstance(fallbackModelName, temperature);
       return await fallback.invoke(messages);
     }
@@ -325,39 +405,63 @@ async function invokeModelWith404Fallback(
  * Node 2: Greeting Node (Small Model: gemini-flash-lite-latest)
  * Sends back an instant, friendly greeting with ZERO database lookup.
  */
-export async function greetingSmallModelNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+export async function greetingSmallModelNode(
+  state: AgentStateType,
+  runConfig?: RunnableConfig
+): Promise<Partial<AgentStateType>> {
   const lastMessage = getLastUserMessage(state.messages);
+  const modelName = config.models?.greeting || 'gemini-flash-lite-latest';
+  const log = createNodeLogger('GreetingNode', runConfig);
+  log.start({ model: modelName, messageLen: lastMessage.length });
 
   const greetingSystemPrompt = `You are Yoho, the AI portfolio assistant for Vyshnav P C (Full-Stack & AI Engineer).
 Reply warmly in 1-2 short sentences; mention you can share Vyshnav's skills, projects, experience, or help schedule a meeting.`;
 
-  const response = await invokeModelWith404Fallback(
-    getGreetingSmallModel(0.3),
-    'gemini-flash-latest',
-    0.3,
-    [new SystemMessage(greetingSystemPrompt), new HumanMessage(lastMessage || 'Hello')]
-  );
+  try {
+    const response = await invokeModelWith404Fallback(
+      getGreetingSmallModel(0.3),
+      'gemini-flash-latest',
+      0.3,
+      [new SystemMessage(greetingSystemPrompt), new HumanMessage(lastMessage || 'Hello')],
+      log
+    );
 
-  const replyText = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+    const replyText = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+    log.done({ replyLen: replyText.length });
 
-  return {
-    finalMessage: replyText,
-    messages: [new AIMessage(replyText)],
-    uiAction: null,
-  };
+    return {
+      finalMessage: replyText,
+      messages: [new AIMessage(replyText)],
+      uiAction: null,
+    };
+  } catch (err: any) {
+    log.fail(err, { step: 'llm_invoke', model: modelName });
+    throw err;
+  }
 }
 
 /**
  * Node 3: PostgreSQL Vector Retriever Node
  * Embeds query keywords using gemini-embedding-2 and retrieves top matching chunks from pgvector.
  */
-export async function pgVectorRetrieverNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+export async function pgVectorRetrieverNode(
+  state: AgentStateType,
+  runConfig?: RunnableConfig
+): Promise<Partial<AgentStateType>> {
   const query = state.extractedKeywords || getLastUserMessage(state.messages);
+  const embeddingModel = config.models.embedding || 'gemini-embedding-2';
+  const log = createNodeLogger('PgVectorRetriever', runConfig);
+  log.start({
+    queryLen: query.length,
+    querySource: state.extractedKeywords ? 'extractedKeywords' : 'lastMessage',
+  });
 
   let retrievedDocs: RetrievedDocument[] = [];
+  let docSource: 'pgvector' | 'local_fallback' | 'empty' = 'empty';
 
   try {
     // Generate query embedding via gemini-embedding-2
+    log.step('Generating embedding and querying pgvector', { embeddingModel, topK: 4 });
     const queryEmbedding = await generateTextEmbedding(query);
 
     // Query PostgreSQL resume_chunks table via cosine distance
@@ -370,9 +474,15 @@ export async function pgVectorRetrieverNode(state: AgentStateType): Promise<Part
         text: `### ${c.title}\n${c.content}`,
         metadata: c.metadata,
       }));
+      docSource = 'pgvector';
+      log.step('pgvector search returned matches', { count: retrievedDocs.length });
+    } else {
+      log.warn('pgvector returned 0 chunks; falling back to local profile sections');
     }
   } catch (err: any) {
-    console.warn(`[PgVectorRetriever] Vector search exception: ${err.message}`);
+    log.warn('Vector search exception; falling back to local profile sections', {
+      error: formatErrorDetails(err),
+    });
   }
 
   // Exception handling fallback (Rule 3): if PostgreSQL has no chunks or is offline,
@@ -396,11 +506,17 @@ export async function pgVectorRetrieverNode(state: AgentStateType): Promise<Part
       });
       scored.sort((a, b) => b.score - a.score);
       retrievedDocs = scored.slice(0, 4);
-    } catch {
-      // Local fallback failed, proceed with empty docs
+      docSource = retrievedDocs.length > 0 ? 'local_fallback' : 'empty';
+      log.step('Local profile fallback completed', {
+        sectionsScanned: sections.length,
+        docsSelected: retrievedDocs.length,
+      });
+    } catch (fallbackErr: any) {
+      log.fail(fallbackErr, { step: 'local_profile_fallback', docs: 0 });
     }
   }
 
+  log.done({ source: docSource, docs: retrievedDocs.length });
   return {
     retrievedDocs,
     classifiedDocs: retrievedDocs,
@@ -408,11 +524,18 @@ export async function pgVectorRetrieverNode(state: AgentStateType): Promise<Part
 }
 
 /**
- * Node 4: Knowledge Node (Big Model: gemini-flash-latest)
+ * Node 4: Knowledge Node (Big Model: gemini-3.5-flash-lite)
  * Synthesizes grounded, accurate, professional answers as Yoho using the retrieved chunks.
  */
-export async function bigModelKnowledgeNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+export async function bigModelKnowledgeNode(
+  state: AgentStateType,
+  runConfig?: RunnableConfig
+): Promise<Partial<AgentStateType>> {
   const lastMessage = getLastUserMessage(state.messages);
+  const modelName = config.models?.big || 'gemini-3.5-flash-lite';
+  const docsCount = state.retrievedDocs?.length || 0;
+  const log = createNodeLogger('KnowledgeNode', runConfig);
+  log.start({ model: modelName, docs: docsCount, messageLen: lastMessage.length });
 
   const contextText =
     (state.retrievedDocs || [])
@@ -425,20 +548,27 @@ Answer concisely and professionally using ONLY the resume context below. Highlig
 CONTEXT:
 ${contextText}`;
 
-  const response = await invokeModelWith404Fallback(
-    getKnowledgeBigModel(0.2),
-    'gemini-flash-latest',
-    0.2,
-    [new SystemMessage(knowledgeSystemPrompt), new HumanMessage(lastMessage)]
-  );
+  try {
+    const response = await invokeModelWith404Fallback(
+      getKnowledgeBigModel(0.2),
+      'gemini-flash-latest',
+      0.2,
+      [new SystemMessage(knowledgeSystemPrompt), new HumanMessage(lastMessage)],
+      log
+    );
 
-  const replyText = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+    const replyText = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+    log.done({ replyLen: replyText.length, docs: docsCount });
 
-  return {
-    finalMessage: replyText,
-    messages: [new AIMessage(replyText)],
-    uiAction: null,
-  };
+    return {
+      finalMessage: replyText,
+      messages: [new AIMessage(replyText)],
+      uiAction: null,
+    };
+  } catch (err: any) {
+    log.fail(err, { step: 'llm_invoke', model: modelName, docs: docsCount });
+    throw err;
+  }
 }
 
 // Backward compatibility node aliases

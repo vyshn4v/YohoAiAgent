@@ -43,9 +43,10 @@ async function promptUser() {
 
     try {
       console.log('Agent is thinking (running LangGraph pipeline)...');
-      const result = await agentGraph.invoke({
-        messages: history,
-      });
+      const result = await agentGraph.invoke(
+        { messages: history },
+        { configurable: { thread_id: conversationId } }
+      );
 
       const lastAiMessage = result.messages[result.messages.length - 1];
       const reply =

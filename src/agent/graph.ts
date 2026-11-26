@@ -16,7 +16,7 @@ import {
  *        |-- (greeting) -> greeting_small_model (Small Model: gemini-flash-lite) -> END
  *        |-- (schedule_enquiry) -> schedule_enquiry (Small Model Contact Extractor + OTP/Booking) -> END
  *        |-- (knowledge_query) -> pgvector_retriever (Embeds with gemini-embedding-2 & queries PostgreSQL)
- *                                  -> knowledge_big_model (Big Model: gemini-flash) -> END
+ *                                  -> knowledge_big_model (Big Model: gemini-3.5-flash-lite) -> END
  */
 export function buildAgentGraph() {
   const workflow = new StateGraph(AgentAnnotation)
