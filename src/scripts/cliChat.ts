@@ -1,6 +1,7 @@
 import readline from 'readline';
 import { v4 as uuidv4 } from 'uuid';
 import { HumanMessage, AIMessage, BaseMessage } from '@langchain/core/messages';
+import { awaitAllCallbacks } from '@langchain/core/callbacks/promises';
 import { agentGraph } from '../agent/graph.js';
 import { startEmailWorker } from '../workers/emailWorker.js';
 
@@ -35,6 +36,7 @@ async function promptUser() {
 
     if (trimmed.toLowerCase() === 'exit' || trimmed.toLowerCase() === 'quit') {
       console.log('\nGoodbye!');
+      await awaitAllCallbacks();
       rl.close();
       process.exit(0);
     }
@@ -45,7 +47,11 @@ async function promptUser() {
       console.log('Agent is thinking (running LangGraph pipeline)...');
       const result = await agentGraph.invoke(
         { messages: history },
-        { configurable: { thread_id: conversationId } }
+        {
+          runName: 'PortfolioAgentCLI',
+          configurable: { thread_id: conversationId },
+          metadata: { conversationId, session_id: conversationId },
+        }
       );
 
       const lastAiMessage = result.messages[result.messages.length - 1];

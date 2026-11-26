@@ -5,17 +5,42 @@ const existingNodeEnv = process.env.NODE_ENV;
 // Load environment variables from .env file
 dotenv.config();
 
-// Auto-configure LangSmith tracking if API key is provided
-if (process.env.LANGCHAIN_API_KEY) {
-  process.env.LANGCHAIN_TRACING_V2 = process.env.LANGCHAIN_TRACING_V2 || 'true';
-  process.env.LANGCHAIN_PROJECT = process.env.LANGCHAIN_PROJECT || 'ai-portfolio-agent';
-  process.env.LANGCHAIN_ENDPOINT = process.env.LANGCHAIN_ENDPOINT || 'https://api.smith.langchain.com';
-}
-
 // Preserve NODE_ENV if it was already set (e.g., 'test' by Vitest)
 if (existingNodeEnv) {
   process.env.NODE_ENV = existingNodeEnv;
 }
+
+/**
+ * Normalizes LANGSMITH_* and LANGCHAIN_* environment variables so LangChain/LangGraph
+ * and the LangSmith SDK share the same API key, tracing flag, project, and endpoint.
+ */
+export function configureLangSmithEnv(env: Record<string, string | undefined> = process.env) {
+  const apiKey = env.LANGSMITH_API_KEY || env.LANGCHAIN_API_KEY || '';
+  const tracing =
+    env.LANGSMITH_TRACING ||
+    env.LANGSMITH_TRACING_V2 ||
+    env.LANGCHAIN_TRACING_V2 ||
+    (apiKey ? 'true' : 'false');
+  const project = env.LANGSMITH_PROJECT || env.LANGCHAIN_PROJECT || 'ai-portfolio-agent';
+  const endpoint =
+    env.LANGSMITH_ENDPOINT || env.LANGCHAIN_ENDPOINT || 'https://api.smith.langchain.com';
+
+  if (apiKey) {
+    env.LANGCHAIN_API_KEY = env.LANGCHAIN_API_KEY || apiKey;
+    env.LANGCHAIN_TRACING_V2 = env.LANGCHAIN_TRACING_V2 || tracing;
+    env.LANGCHAIN_PROJECT = env.LANGCHAIN_PROJECT || project;
+    env.LANGCHAIN_ENDPOINT = env.LANGCHAIN_ENDPOINT || endpoint;
+
+    env.LANGSMITH_API_KEY = env.LANGSMITH_API_KEY || apiKey;
+    env.LANGSMITH_TRACING = env.LANGSMITH_TRACING || tracing;
+    env.LANGSMITH_PROJECT = env.LANGSMITH_PROJECT || project;
+    env.LANGSMITH_ENDPOINT = env.LANGSMITH_ENDPOINT || endpoint;
+  }
+
+  return { tracingV2: tracing, apiKey, project, endpoint };
+}
+
+const langsmithConfig = configureLangSmithEnv(process.env);
 
 // Resolve provider selection once, preserving precedence and defaults
 const resolvedProvider =
@@ -105,12 +130,7 @@ export const config = {
 
   hostEmail: process.env.HOST_EMAIL || 'vyshnav@example.com',
 
-  langsmith: {
-    tracingV2: process.env.LANGCHAIN_TRACING_V2 || 'true',
-    apiKey: process.env.LANGCHAIN_API_KEY || '',
-    project: process.env.LANGCHAIN_PROJECT || 'ai-portfolio-agent',
-    endpoint: process.env.LANGCHAIN_ENDPOINT || 'https://api.smith.langchain.com',
-  },
+  langsmith: langsmithConfig,
 
   cors: {
     origin: process.env.CORS_ORIGIN || '*',

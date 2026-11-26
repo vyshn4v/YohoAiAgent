@@ -212,7 +212,12 @@ async function handleSseChatStream(
 
     const stream = agentGraph.streamEvents(
       { messages: updatedHistory, leadInfo: session.leadInfo },
-      { version: 'v2', configurable: { thread_id: conversationId } }
+      {
+        version: 'v2',
+        runName: 'PortfolioAgentChat',
+        configurable: { thread_id: conversationId },
+        metadata: { conversationId, session_id: conversationId },
+      }
     );
 
     for await (const event of stream) {
@@ -393,7 +398,11 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
         messages: updatedHistory,
         leadInfo: session.leadInfo,
       },
-      { configurable: { thread_id: conversationId } }
+      {
+        runName: 'PortfolioAgentChat',
+        configurable: { thread_id: conversationId },
+        metadata: { conversationId, session_id: conversationId },
+      }
     );
 
     const lastAiMsg = finalState.messages[finalState.messages.length - 1];

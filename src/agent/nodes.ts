@@ -2,6 +2,8 @@ import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from '@langchain/
 import type { RunnableConfig } from '@langchain/core/runnables';
 import { ChatOpenAI } from '@langchain/openai';
 import { GoogleGenAI } from '@google/genai';
+import { traceable } from 'langsmith/traceable';
+import { isRunnableConfigLike } from 'langsmith/run_trees';
 import { z } from 'zod';
 import { config } from '../config/index.js';
 import { AgentStateType, LeadInfo } from './state.js';
@@ -102,6 +104,20 @@ const OUT_OF_SCOPE_REPLY =
 type DecisionIntent = 'greeting' | 'schedule_enquiry' | 'knowledge_query' | 'out_of_scope';
 
 /**
+ * Invokes a LangSmith traceable wrapper while preserving parent-child LangGraph nesting
+ * whenever RunnableConfig carries an active LangChainTracer callback manager.
+ */
+function invokeTraceable<Args extends any[], Res>(
+  tracedFn: (...args: any[]) => Promise<Res>,
+  runConfig: RunnableConfig | undefined,
+  ...args: Args
+): Promise<Res> {
+  return isRunnableConfigLike(runConfig as any)
+    ? tracedFn(runConfig as any, ...args)
+    : tracedFn(...args);
+}
+
+/**
  * Decision Node: Calls gemini-decision-1 via official @google/genai SDK (Zero LLM)
  * If failed, returns error message to user to try again later.
  */
@@ -144,6 +160,35 @@ async function callDecisionModel(message: string): Promise<DecisionIntent> {
   return choice;
 }
 
+const tracedCallDecisionModel = traceable(callDecisionModel, {
+  name: 'gemini-decision-1',
+  run_type: 'llm',
+  metadata: {
+    provider: 'google_genai',
+    model: config.models.decision || 'gemini-decision-1',
+  },
+});
+
+const tracedGenerateQueryEmbedding = traceable(
+  async (query: string) => generateTextEmbedding(query),
+  {
+    name: 'generateTextEmbedding',
+    run_type: 'embedding',
+    metadata: {
+      provider: config.llm.provider,
+      model: config.models.embedding || 'gemini-embedding-2',
+    },
+  }
+);
+
+const tracedSearchResumeChunks = traceable(
+  async (queryEmbedding: number[], topK: number) => searchResumeChunks(queryEmbedding, topK),
+  {
+    name: 'pgvector_search_resume_chunks',
+    run_type: 'retriever',
+  }
+);
+
 export async function decisionRouterNode(
   state: AgentStateType,
   runConfig?: RunnableConfig
@@ -158,7 +203,7 @@ export async function decisionRouterNode(
   });
 
   try {
-    const intent = await callDecisionModel(lastMessage);
+    const intent = await invokeTraceable(tracedCallDecisionModel, runConfig, lastMessage);
     const mappedIntent = intent === 'knowledge_query' ? 'profile_query' : intent;
     const nextNode =
       mappedIntent === 'greeting'
@@ -232,7 +277,7 @@ export async function scheduleEnquiryNode(
     const conversationContext = state.messages
       .map((m) => `${m._getType() === 'human' ? 'User' : 'Assistant'}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`)
       .join('\n');
-    const extracted = await extractor.invoke(conversationContext || lastMessage);
+    const extracted = await extractor.invoke(conversationContext || lastMessage, runConfig);
 
     const mergedLeadInfo: LeadInfo = {
       ...state.leadInfo,
@@ -256,10 +301,13 @@ export async function scheduleEnquiryNode(
       currentStep = 'verify_otp_tool';
       log.step('Verifying submitted OTP', { hasLeadEmail: Boolean(mergedLeadInfo.email) });
       const emailToVerify = mergedLeadInfo.email || 'user@example.com';
-      const verifyRes = await verifyOtpTool.invoke({
-        email: emailToVerify,
-        otp: extracted.otp,
-      });
+      const verifyRes = await verifyOtpTool.invoke(
+        {
+          email: emailToVerify,
+          otp: extracted.otp,
+        },
+        runConfig
+      );
       const parsed = parseToolOutput(verifyRes);
 
       if (parsed.status !== 'verified') {
@@ -287,12 +335,15 @@ export async function scheduleEnquiryNode(
 
       currentStep = 'schedule_enquiry_after_otp';
       log.step('OTP verified; finalizing enquiry booking');
-      const scheduleRes = await scheduleEnquiryTool.invoke({
-        name: mergedLeadInfo.name,
-        email: emailToVerify,
-        phone: mergedLeadInfo.phone || 'Not provided',
-        reason: mergedLeadInfo.reason || 'General portfolio consultation / enquiry',
-      });
+      const scheduleRes = await scheduleEnquiryTool.invoke(
+        {
+          name: mergedLeadInfo.name,
+          email: emailToVerify,
+          phone: mergedLeadInfo.phone || 'Not provided',
+          reason: mergedLeadInfo.reason || 'General portfolio consultation / enquiry',
+        },
+        runConfig
+      );
       const scheduleParsed = parseToolOutput(scheduleRes);
 
       if (scheduleParsed.status !== 'confirmed') {
@@ -342,12 +393,15 @@ export async function scheduleEnquiryNode(
     // 3. Name and email available: attempt scheduling or dispatch verification OTP if unverified
     currentStep = 'schedule_enquiry_tool';
     log.step('Checking verification and scheduling enquiry');
-    const scheduleRes = await scheduleEnquiryTool.invoke({
-      name: mergedLeadInfo.name,
-      email: mergedLeadInfo.email,
-      phone: mergedLeadInfo.phone || 'Not provided',
-      reason: mergedLeadInfo.reason || 'General consultation',
-    });
+    const scheduleRes = await scheduleEnquiryTool.invoke(
+      {
+        name: mergedLeadInfo.name,
+        email: mergedLeadInfo.email,
+        phone: mergedLeadInfo.phone || 'Not provided',
+        reason: mergedLeadInfo.reason || 'General consultation',
+      },
+      runConfig
+    );
     const scheduleParsed = parseToolOutput(scheduleRes);
 
     if (scheduleParsed.status === 'confirmed') {
@@ -364,10 +418,13 @@ export async function scheduleEnquiryNode(
     if (scheduleParsed.status === 'unverified') {
       currentStep = 'send_verification_otp_tool';
       log.step('Email unverified; dispatching verification OTP');
-      const otpRes = await sendVerificationOtpTool.invoke({
-        email: mergedLeadInfo.email,
-        name: mergedLeadInfo.name,
-      });
+      const otpRes = await sendVerificationOtpTool.invoke(
+        {
+          email: mergedLeadInfo.email,
+          name: mergedLeadInfo.name,
+        },
+        runConfig
+      );
       const otpParsed = parseToolOutput(otpRes);
       const isSent = otpParsed.status === 'sent';
       if (!isSent) {
@@ -410,17 +467,18 @@ async function invokeModelWith404Fallback(
   fallbackModelName: string,
   temperature: number,
   messages: BaseMessage[],
-  log?: NodeLogger
+  log?: NodeLogger,
+  runConfig?: RunnableConfig
 ) {
   try {
-    return await model.invoke(messages);
+    return await model.invoke(messages, runConfig);
   } catch (err: any) {
     if (err?.status === 404 || err?.lc_error_code === 'MODEL_NOT_FOUND') {
       log?.warn('Primary model returned 404/MODEL_NOT_FOUND; falling back', {
         fallbackModel: fallbackModelName,
       });
       const fallback = createModelInstance(fallbackModelName, temperature);
-      return await fallback.invoke(messages);
+      return await fallback.invoke(messages, runConfig);
     }
     throw err;
   }
@@ -448,7 +506,8 @@ Reply warmly in 1-2 short sentences; mention you can share Vyshnav's skills, pro
       'gemini-flash-latest',
       0.3,
       [new SystemMessage(greetingSystemPrompt), new HumanMessage(lastMessage || 'Hello')],
-      log
+      log,
+      runConfig
     );
 
     const replyText = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
@@ -487,10 +546,10 @@ export async function pgVectorRetrieverNode(
   try {
     // Generate query embedding via gemini-embedding-2
     log.step('Generating embedding and querying pgvector', { embeddingModel, topK: 4 });
-    const queryEmbedding = await generateTextEmbedding(query);
+    const queryEmbedding = await invokeTraceable(tracedGenerateQueryEmbedding, runConfig, query);
 
     // Query PostgreSQL resume_chunks table via cosine distance
-    const pgChunks = await searchResumeChunks(queryEmbedding, 4);
+    const pgChunks = await invokeTraceable(tracedSearchResumeChunks, runConfig, queryEmbedding, 4);
 
     if (pgChunks && pgChunks.length > 0) {
       retrievedDocs = pgChunks.map((c) => ({
@@ -568,7 +627,7 @@ export async function bigModelKnowledgeNode(
       .join('\n\n') || 'Vyshnav P C is a Full-Stack & AI Engineer specialized in LangGraph, TypeScript, Python, and Node.js.';
 
   const knowledgeSystemPrompt = `You are Yoho, AI assistant for Vyshnav P C (Full-Stack & AI Engineer).
-Answer concisely and professionally using ONLY the resume context below. Highlight concrete skills and results. If missing, state what is known and offer a call.
+Answer concisely and professionally using ONLY the context below. Highlight concrete skills and results. If missing, state what is known and offer a call.
 
 CONTEXT:
 ${contextText}`;
@@ -579,7 +638,8 @@ ${contextText}`;
       'gemini-flash-latest',
       0.2,
       [new SystemMessage(knowledgeSystemPrompt), new HumanMessage(lastMessage)],
-      log
+      log,
+      runConfig
     );
 
     const replyText = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
