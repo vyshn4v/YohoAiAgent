@@ -1,20 +1,21 @@
 # AI Agent Backend: Yoho (Vyshnav P C's Portfolio Assistant)
 
-A production-grade, multi-agent AI backend service built with **TypeScript**, **LangGraph.js**, **OpenRouter**, **Pinecone**, **BullMQ**, and **Redis**.
+A production-grade, multi-agent AI backend service built with **TypeScript**, **LangGraph.js**, **Google Gemini**, **In-Memory Structured Profile Slicing**, **BullMQ**, and **Redis**.
 
-The service powers **Yoho**, the dedicated AI assistant for **[Vyshnav P C](https://portfolio.vyshnavpc.com/)** (Full-Stack & Generative AI Developer based in Kannur, Kerala). It combines Retrieval-Augmented Generation (RAG) strictly grounded in verified portfolio facts with an automated meeting/consultation scheduling workflow backed by OTP email verification.
+The service powers **Yoho**, the dedicated AI assistant for **[Vyshnav P C](https://portfolio.vyshnavpc.com/)** (Full-Stack & Generative AI Developer based in Kannur, Kerala). It combines a 3-tier LangGraph architecture grounded in verified portfolio facts with an automated meeting/consultation scheduling workflow backed by OTP email verification.
 
 ---
 
 ## 🌟 Core Capabilities
 
-1. **Multi-Agent RAG Knowledge Assistant (Strictly No Web Search)**:
-   - Answers questions regarding Vyshnav's background, production experience (SDE-I at Neutrinos, Sunlife Philippines, 1,000–2,000 req/min decision engine), flagship systems ([Domain Scanner SaaS](https://domainscanner.vyshnavpc.com), QStack), tech stack, and [LixerLab](https://lixerlab.vyshnavpc.com/) agency services.
-   - Uses a 3-agent orchestration graph:
-     - **Agent 1 (Intent & Context Classifier)**: Discerning profile queries from scheduling requests and general greetings.
-     - **Pinecone Vector Search / Local Fallback**: Performs vector similarity search over chunked markdown knowledge in `src/data/profile.md`.
-     - **Agent 2 (Relevance Classifier)**: Filters out irrelevant chunks to prevent hallucination.
-     - **Agent 3 (Profile Synthesizer)**: Formulates friendly, fact-grounded responses with natural emojis and context.
+1. **Multi-Agent Knowledge Assistant (Strictly No Web Search)**:
+   - Answers questions regarding Vyshnav's background, production experience (SDE-I at Neutrinos, Sunlife Philippines, 1,000–2,000 req/min decision engine), flagship systems ([Domain Scanner SaaS](https://domainscanner.vyshnavpc.com), [YohoAiAgent](https://github.com/vyshn4v/YohoAiAgent)), tech stack, and [LixerLab](https://lixerlab.vyshnavpc.com/) agency services.
+   - **Zero-Token In-Memory Profile Slicing**: Slices relevant sections from `src/data/profile.json` in `0ms` with zero token waste.
+   - **Clean Plain-Text Guardrails**: Outputs clean markdown with standard bullet points (`-`), strictly zero HTML tags (`<br>`, `<table>`, etc.), and zero unsolicited tips or conclusions.
+   - Uses a 3-phase orchestration graph:
+     - **Phase 1 (`firstRouterAndUiNode`)**: Classifies intent, extracts contact details and OTP codes, and resolves direct chats in 1 AI call.
+     - **Phase 2 (`secondExtractorNode`)**: Extracts verified facts from sliced `profile.json` data via structured schema.
+     - **Phase 3 (`thirdGeneratorNode`)**: Synthesizes clean, direct answers as **Yoho** with zero hallucination.
 
 2. **Autonomous Meeting & Consultation Booking with OTP Verification**:
    - Enables prospective clients, recruiters, and collaborators to book consultations directly through the chat.
@@ -39,28 +40,25 @@ The service powers **Yoho**, the dedicated AI assistant for **[Vyshnav P C](http
                       |   User /api/chat Request   |
                       +--------------+--------------+
                                      |
-                         [Intent Classification]
+                     [Phase 1: firstRouterAndUiNode]
                                      |
                +---------------------+---------------------+
                |                                           |
-    [Intent: profile_query]                     [Intent: schedule_enquiry]
+    [Intent: profile_query]                     [Intent: direct / schedule / greeting]
                |                                           |
 +------------------------------+             +------------------------------+
-| Agent 1: Keyword Extractor   |             | Enquiry & Tool Coordinator   |
-+--------------+---------------+             +--------------+---------------+
-               |                                            |
-+------------------------------+             +------------------------------+
-| Pinecone Vector Retrieval    |             | 1. send_verification_otp     |
-| (Fallback: Local Chunks)     |             |    -> Encrypt & save in Redis|
-+--------------+---------------+             |    -> Enqueue BullMQ mail job|
-               |                             | 2. verify_otp                |
-+------------------------------+             |    -> Constant-time compare  |
-| Agent 2: Relevance Classifier|             |    -> Set verified in Redis  |
+| In-Memory Slicing            |             | Direct AI Response / Booking |
+| (src/data/profile.json)      |             | 1. send_verification_otp     |
++--------------+---------------+             |    -> SHA-256 hash in Redis  |
+               |                             |    -> Enqueue BullMQ mail job|
++------------------------------+             | 2. verify_otp                |
+| Phase 2: Fact Extractor      |             |    -> Constant-time compare  |
+| (Structured JSON facts)      |             |    -> Set verified in Redis  |
 +--------------+---------------+             | 3. schedule_enquiry          |
                |                             |    -> Require verified email |
-+------------------------------+             |    -> Promise 24h response   |
-| Agent 3: Profile Synthesizer |             +--------------+---------------+
-| (Strictly verified facts)    |                            |
++------------------------------+             |    -> Promise 24h SLA        |
+| Phase 3: Response Synthesizer|             +--------------+---------------+
+| (Clean plain text, no HTML)  |                            |
 +--------------+---------------+                            |
                |                                            |
                +---------------------+----------------------+
@@ -75,27 +73,31 @@ The service powers **Yoho**, the dedicated AI assistant for **[Vyshnav P C](http
 ```
 AiAgent/
 ├── data/
-│   └── profile.md               # Synchronized profile markdown
+│   └── profile.json             # Synchronized profile database
 ├── src/
 │   ├── agent/                   # LangGraph multi-agent state machine & nodes
 │   │   ├── graph.ts             # StateGraph definition & conditional edges
-│   │   ├── nodes.ts             # Agent nodes (Intent, Relevance, Synthesizer, Enquiry)
+│   │   ├── nodes.ts             # 3-Phase agent nodes (Router, Extractor, Generator)
 │   │   └── state.ts             # LangGraph state annotations & Lead schema
-│   ├── config/                  # Environment variable validation & defaults
+│   ├── config/                  # Multi-provider environment configuration (Gemini, Groq, NVIDIA, OpenRouter)
 │   ├── data/
-│   │   └── profile.md           # Ground-truth profile & knowledge base document
+│   │   └── profile.json         # Ground-truth structured portfolio database
 │   ├── docs/                    # OpenAPI / Swagger specification
 │   ├── queues/                  # BullMQ email queue producer & connection setup
 │   ├── scripts/
 │   │   ├── cliChat.ts           # Interactive terminal CLI chat for testing
-│   │   └── ingest.ts            # Chunks & embeds profile.md into Pinecone
+│   │   └── ingest.ts            # Optional Pinecone vector ingestion script
 │   ├── services/
 │   │   ├── emailService.ts      # Nodemailer SMTP transporter & templates
 │   │   ├── otpService.ts        # OTP generation, Redis crypto storage, and verification
-│   │   └── pineconeService.ts   # Vector embeddings & Pinecone semantic search
-│   ├── tools/                   # LangChain tool definitions (OTP & Scheduling)
+│   │   ├── profileLoader.ts     # In-memory category slicer and typed JSON loader
+│   │   └── pineconeService.ts   # Optional vector search service
+│   ├── tools/                   # AI tool definitions (OTP & Scheduling)
 │   ├── workers/                 # BullMQ background consumer worker
 │   └── server.ts                # Express REST API, CORS, SSE streaming & Swagger UI
+├── docs/
+│   ├── ARCHITECTURE.md          # Comprehensive architecture specification
+│   └── FRONTEND_INTEGRATION_GUIDE.md # Frontend SSE integration & widgets
 ├── tests/                       # Vitest integration & unit test suite
 ├── package.json
 └── README.md
@@ -106,10 +108,9 @@ AiAgent/
 ## 🚀 Getting Started
 
 ### 1. Prerequisites
-- **Node.js**: v18+ (tested on Node v26)
-- **Redis**: Local Redis (`redis-server`), WSL2, Docker, or managed cloud Redis (e.g. [Upstash](https://upstash.com)).
-- **OpenRouter API Key**: For LLM calls (`https://openrouter.ai`).
-- **Pinecone API Key**: (Optional for local development; system automatically falls back to local semantic chunks from `src/data/profile.md`).
+- **Node.js**: v18+ (tested on Node v20/v26)
+- **Redis**: Local Redis (`redis-server`), WSL2, Docker, or managed cloud Redis.
+- **Google Gemini API Key**: Free tier API key from [Google AI Studio](https://aistudio.google.com/).
 
 ### 2. Environment Configuration
 Copy `.env.example` to `.env` and configure your credentials:
@@ -118,32 +119,27 @@ cp .env.example .env
 ```
 
 Key environment variables:
-| Variable | Description |
-| :--- | :--- |
-| `PORT` | API server port (default: `3000`). |
-| `OPENROUTER_API_KEY` | OpenRouter API key for LLM execution. |
-| `OPENROUTER_MODEL` | Model identifier (e.g. `openai/gpt-4o-mini`, `anthropic/claude-3.5-sonnet`). |
-| `REDIS_HOST`, `REDIS_PORT` | Connection host and port for Redis. |
-| `REDIS_PASSWORD` | Redis password (leave empty if none). |
-| `PINECONE_API_KEY` | Pinecone API key. |
-| `PINECONE_INDEX_NAME` | Pinecone index name (e.g. `ai-agent-dev`). |
-| `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS` | SMTP credentials for sending verification emails. |
-| `HOST_EMAIL` | Destination inbox for verified lead notifications. |
-| `CORS_ORIGIN` | Allowed CORS origins (e.g. `*` or `https://portfolio.vyshnavpc.com`). |
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `PORT` | API server port | `3000` |
+| `LLM_PROVIDER` | Active LLM provider (`gemini`, `groq`, `nvidia`, `openrouter`) | `gemini` |
+| `GEMINI_API_KEY` | Google AI Studio API key | (Required) |
+| `GEMINI_BASE_URL` | OpenAI-compatible endpoint | `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| `GEMINI_MODEL` | Active model identifier | `gemini-flash-lite-latest` |
+| `REDIS_HOST`, `REDIS_PORT` | Connection host and port for Redis | `localhost`, `6379` |
+| `REDIS_PASSWORD` | Redis password (leave empty if none) | `""` |
+| `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS` | SMTP credentials for sending verification emails | — |
+| `HOST_EMAIL` | Destination inbox for verified lead notifications (users should configure a valid destination for notifications) | `vyshnav@example.com` |
+| `CORS_ORIGIN` | Allowed CORS origins | `*` |
 
-### 3. Knowledge Base Profile (`src/data/profile.md`)
-The profile file at `src/data/profile.md` contains the complete knowledge base scraped directly from [https://portfolio.vyshnavpc.com/](https://portfolio.vyshnavpc.com/):
-- **Overview & Identity:** SDE-I, full-stack, distributed systems, and agentic AI.
+### 3. Ground Truth Profile Database (`src/data/profile.json`)
+All facts are centralized in `src/data/profile.json`:
+- **Identity & Bio:** SDE-I, full-stack, distributed systems, and agentic AI.
 - **Experience:** Neutrinos (Sunlife Philippines enterprise project, 1,000–2,000 req/min decision engine).
-- **Flagship Projects:** [Domain Scanner SaaS](https://domainscanner.vyshnavpc.com) and QStack modular monolith.
+- **Flagship Projects:** [Domain Scanner SaaS](https://domainscanner.vyshnavpc.com) and [YohoAiAgent](https://github.com/vyshn4v/YohoAiAgent).
 - **Agency Initiative:** [LixerLab](https://lixerlab.vyshnavpc.com/).
-- **Certifications & Education:** AWS Solutions Architect, Meta, Udemy, Akshay Saini verified courses, and Brototype Bootcamp.
+- **Certifications & Education:** AWS Solutions Architect, Meta, Udemy, Akshay Saini verified courses, Brototype Bootcamp.
 - **Scheduling Policy:** 24h follow-up guarantee, OTP requirements, and contact validation.
-
-To index this profile into your Pinecone vector database:
-```bash
-npm run ingest
-```
 
 ### 4. Running the Development Server
 ```bash
@@ -158,70 +154,26 @@ npm run worker
 ```
 
 ### 6. Interactive Terminal Chat
-Test conversation, profile inquiries, and multi-turn meeting scheduling directly in your terminal:
+Test conversational flows directly in your terminal:
 ```bash
 npm run test:chat
 ```
 
 ### 7. Running the Test Suite
-Execute the automated Vitest test suite (includes LangGraph orchestrations, tool executions, E2E multi-turn scheduling, and API endpoints):
 ```bash
 npm test
 ```
 
 ---
 
-## 📡 API Reference & Swagger UI
+## 🛡️ Guardrails & Formatting Rules
 
-Interactive Swagger UI documentation is available at:
-- **Swagger UI Interface**: `http://localhost:3000/api/docs`
-- **OpenAPI 3.0 JSON Spec**: `http://localhost:3000/api/docs.json`
-- **Root URL (`/`)**: Automatically redirects to `/api/docs`
-
-### Key Endpoints
-
-#### 1. `POST /api/chat`
-Send a synchronous message to the multi-agent system.
-```bash
-curl -X POST http://localhost:3000/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "What projects has Vyshnav built?", "conversationId": "session-1"}'
-```
-**Response:**
-```json
-{
-  "reply": "Vyshnav has engineered notable production systems including Domain Scanner...",
-  "conversationId": "session-1",
-  "intent": "profile_query",
-  "retrievedCount": 2
-}
-```
-
-#### 2. `POST /api/chat/stream` or `GET /api/chat/stream` (SSE)
-Real-time streaming over Server-Sent Events. Emits:
-- `event: status`: Status updates (`searching_knowledge_base`, `generating_answer`, `coordinating_tools`).
-- `event: token`: Incremental tokens as generated by the LLM.
-- `event: done`: Final message object with conversation metadata.
-
-#### 3. `GET /api/health`
-Checks health and connectivity of Redis, OpenRouter, and Pinecone.
-
-#### 4. `POST /api/ingest`
-Triggers semantic chunking and embedding of `src/data/profile.md` into Pinecone.
-
-#### 5. `GET /api/enquiries`
-Retrieves all confirmed and verified meeting bookings.
-
----
-
-## 🔒 Security & Spam Prevention
-
-- **Strict RAG Grounding**: The Profile Synthesizer agent is instructed to **never browse the live internet** and **never hallucinate** outside the verified markdown profile chunks.
-- **Constant-Time OTP Validation**: OTP verification uses cryptographic constant-time comparison to protect against timing attacks.
-- **Short-Lived Ephemeral State**: OTP codes expire in 5 minutes in Redis and are destroyed immediately upon successful verification.
-- **Rate-Limiting & Sanitization**: Anti-abuse limits on OTP dispatch to prevent mail bombing.
+1. **Strictly Grounded (No Web Search)**: Yoho answers queries strictly from the verified facts in `src/data/profile.json`.
+2. **Pure Plain Text (No HTML)**: The prompt strictly forbids HTML tags (`<br>`, `<table>`, `<tr>`, `<td>`, `<p>`, `<div>`). Output is rendered as standard markdown bullets (`-`).
+3. **No Unsolicited Wrap-Ups**: Concluding summaries, commentary, and tips (e.g. `"💡 Tip:"`, `"✨ Summary:"`) are completely suppressed.
+4. **24-Hour SLA Commitment**: All booking and consultation flows commit to a personal response from Vyshnav within 24 hours.
 
 ---
 
 ## 📄 License
-ISC © [Vyshnav P C](https://portfolio.vyshnavpc.com/)
+ISC © Vyshnav P C

@@ -14,9 +14,25 @@ export const AgentAnnotation = Annotation.Root({
     reducer: messagesStateReducer,
     default: () => [],
   }),
-  intent: Annotation<'profile_query' | 'schedule_enquiry' | 'general_chat'>({
+  intent: Annotation<'profile_query' | 'schedule_enquiry' | 'general_chat' | 'direct' | 'knowledge'>({
     reducer: (_, next) => next,
     default: () => 'profile_query',
+  }),
+  categories: Annotation<string[]>({
+    reducer: (_, next) => next,
+    default: () => [],
+  }),
+  slicedData: Annotation<Record<string, any>>({
+    reducer: (_, next) => next,
+    default: () => ({}),
+  }),
+  relevantFacts: Annotation<string[]>({
+    reducer: (_, next) => next,
+    default: () => [],
+  }),
+  finalMessage: Annotation<string>({
+    reducer: (_, next) => next,
+    default: () => '',
   }),
   extractedKeywords: Annotation<string>({
     reducer: (_, next) => next,
@@ -33,6 +49,10 @@ export const AgentAnnotation = Annotation.Root({
   leadInfo: Annotation<LeadInfo>({
     reducer: (current, next) => ({ ...current, ...next }),
     default: () => ({}),
+  }),
+  isVerified: Annotation<boolean>({
+    reducer: (_, next) => next,
+    default: () => false,
   }),
   uiAction: Annotation<Record<string, any> | null>({
     reducer: (_, next) => next,
