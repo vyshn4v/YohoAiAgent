@@ -1,6 +1,9 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { AIMessage } from '@langchain/core/messages';
 import { app } from '../src/server.js';
+import { agentGraph } from '../src/agent/graph.js';
 import { redisClient } from '../src/services/redisClient.js';
+import * as sessionStore from '../src/http/sessionStore.js';
 import { Server } from 'http';
 
 describe('Express REST API Endpoints', () => {
@@ -15,6 +18,11 @@ describe('Express REST API Endpoints', () => {
         resolve();
       });
     });
+  });
+
+  afterEach(() => {
+    delete process.env.ADMIN_API_KEY;
+    vi.restoreAllMocks();
   });
 
   afterAll(async () => {
@@ -141,5 +149,112 @@ describe('Express REST API Endpoints', () => {
     expect(data.reply.length).toBeGreaterThan(0);
     expect(data.conversationId).toBe('test-session-123');
     expect(data.intent).toBe('profile_query');
+  });
+
+  it('requires ADMIN_API_KEY on GET /api/enquiries and POST /api/ingest and batches enquiry reads', async () => {
+    delete process.env.ADMIN_API_KEY;
+    const unconfiguredRes = await fetch(`${baseUrl}/api/enquiries`);
+    expect(unconfiguredRes.status).toBe(503);
+
+    process.env.ADMIN_API_KEY = 'super-secret-admin-key';
+    const unauthorizedRes = await fetch(`${baseUrl}/api/ingest`, { method: 'POST' });
+    expect(unauthorizedRes.status).toBe(401);
+
+    const wrongKeyRes = await fetch(`${baseUrl}/api/enquiries`, {
+      headers: { 'x-api-key': 'wrong-key' },
+    });
+    expect(wrongKeyRes.status).toBe(401);
+
+    vi.spyOn(redisClient, 'lrange').mockResolvedValueOnce(['id-1', 'id-2']);
+    const mgetSpy = vi
+      .spyOn(redisClient, 'mget')
+      .mockResolvedValueOnce([
+        JSON.stringify({ id: 'id-1', name: 'Alice' }),
+        null,
+      ]);
+
+    const okRes = await fetch(`${baseUrl}/api/enquiries`, {
+      headers: { 'x-api-key': 'super-secret-admin-key' },
+    });
+    expect(okRes.status).toBe(200);
+    const body = await okRes.json();
+    expect(mgetSpy).toHaveBeenCalledWith(['enquiry:id-1', 'enquiry:id-2']);
+    expect(body.count).toBe(1);
+    expect(body.enquiries[0].name).toBe('Alice');
+  });
+
+  it('POST /api/chat/stream emits status, tokens, ui_action, done, and saves completed session', async () => {
+    vi.spyOn(sessionStore, 'getConversationSession').mockResolvedValueOnce({
+      messages: [],
+      leadInfo: {},
+      isVerified: false,
+      updatedAt: Date.now(),
+    });
+    const saveSpy = vi.spyOn(sessionStore, 'saveConversationSession').mockResolvedValueOnce();
+
+    vi.spyOn(agentGraph, 'streamEvents').mockImplementationOnce(async function* () {
+      yield { event: 'on_chain_start', metadata: { langgraph_node: 'decision_router' } } as any;
+      yield {
+        event: 'on_chain_end',
+        name: 'LangGraph',
+        data: {
+          output: {
+            intent: 'schedule_enquiry',
+            leadInfo: { name: 'Alex', email: 'alex@example.com' },
+            isVerified: false,
+            uiAction: { type: 'otp_input', email: 'alex@example.com', length: 6 },
+            messages: [new AIMessage('Code sent')],
+          },
+        },
+      } as any;
+    } as any);
+
+    const res = await fetch(`${baseUrl}/api/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'Schedule call', conversationId: 'sse-complete-1' }),
+    });
+
+    expect(res.status).toBe(200);
+    const fullText = await res.text();
+    expect(fullText).toContain('event: status');
+    expect(fullText).toContain('event: token');
+    expect(fullText).toContain('event: ui_action');
+    expect(fullText).toContain('event: done');
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(saveSpy.mock.calls[0][1][1]).toBeInstanceOf(AIMessage);
+  });
+
+  it('POST /api/chat/stream does not persist empty turn if client disconnects mid-stream', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(sessionStore, 'getConversationSession').mockResolvedValueOnce({
+      messages: [],
+      leadInfo: {},
+      isVerified: false,
+      updatedAt: Date.now(),
+    });
+    const saveSpy = vi.spyOn(sessionStore, 'saveConversationSession').mockResolvedValue();
+
+    vi.spyOn(agentGraph, 'streamEvents').mockImplementationOnce(async function* () {
+      yield { event: 'on_chain_start', metadata: { langgraph_node: 'decision_router' } } as any;
+      await new Promise((r) => setTimeout(r, 150));
+      yield {
+        event: 'on_chain_end',
+        name: 'LangGraph',
+        data: { output: { messages: [new AIMessage('Late reply')] } },
+      } as any;
+    } as any);
+
+    const res = await fetch(`${baseUrl}/api/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hi', conversationId: 'sse-abort-1' }),
+    });
+    const reader = res.body!.getReader();
+    await reader.read();
+    await reader.cancel();
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(saveSpy).not.toHaveBeenCalled();
   });
 });

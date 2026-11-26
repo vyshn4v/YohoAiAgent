@@ -129,6 +129,7 @@ Key environment variables:
 | `REDIS_PASSWORD` | Redis password (leave empty if none) | `""` |
 | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS` | SMTP credentials for sending verification emails | — |
 | `HOST_EMAIL` | Destination inbox for verified lead notifications (users should configure a valid destination for notifications) | `vyshnav@example.com` |
+| `ADMIN_API_KEY` | API key required via `x-api-key` or `Bearer` token for `/api/ingest` and `/api/enquiries` | `""` |
 | `CORS_ORIGIN` | Allowed CORS origins | `*` |
 
 ### 3. Indexing Resume Knowledge (`pgvector`)

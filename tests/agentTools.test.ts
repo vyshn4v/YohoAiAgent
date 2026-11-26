@@ -85,6 +85,7 @@ describe('Agent Tools', () => {
       vi.spyOn(otpService, 'isEmailVerified').mockResolvedValue(true);
       vi.spyOn(redisClient, 'set').mockResolvedValue('OK' as any);
       vi.spyOn(redisClient, 'lpush').mockResolvedValue(1 as any);
+      const ltrimSpy = vi.spyOn(redisClient, 'ltrim').mockResolvedValue('OK' as any);
       const queueSpy = vi.spyOn(emailQueue, 'enqueueLeadNotification').mockResolvedValue('job-lead-1' as any);
 
       const res = await scheduleEnquiryTool.invoke({
@@ -98,6 +99,7 @@ describe('Agent Tools', () => {
       expect(parsed.status).toBe('confirmed');
       expect(parsed.enquiryId).toBeDefined();
       expect(parsed.message).toContain('within 24 hours');
+      expect(ltrimSpy).toHaveBeenCalledWith('enquiries:list', 0, 999);
       expect(queueSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           name: 'John Doe',

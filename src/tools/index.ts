@@ -147,8 +147,9 @@ export const scheduleEnquiryTool = tool(
         86400 * 30 // Retain for 30 days
       );
 
-      // Add to enquiries list
+      // Add to enquiries list (bounded to latest 1000 enquiries)
       await redisClient.lpush('enquiries:list', enquiryId);
+      await redisClient.ltrim('enquiries:list', 0, 999);
 
       // Enqueue notification email to host via BullMQ
       await enqueueLeadNotification({ name, email, phone, reason });

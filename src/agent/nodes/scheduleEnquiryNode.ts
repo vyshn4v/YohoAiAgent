@@ -36,18 +36,18 @@ function buildScheduleReply(
 }
 
 async function handleOtpVerificationFlow(params: {
+  email: string;
   otp: string;
   leadInfo: LeadInfo;
   log: NodeLogger;
   runConfig?: RunnableConfig;
   setStep: (step: string) => void;
 }): Promise<Partial<AgentStateType>> {
-  const { otp, leadInfo, log, runConfig, setStep } = params;
-  const emailToVerify = leadInfo.email || 'user@example.com';
+  const { email, otp, leadInfo, log, runConfig, setStep } = params;
 
   setStep('verify_otp_tool');
   log.step('Verifying submitted OTP', { hasLeadEmail: Boolean(leadInfo.email) });
-  const verifyRes = await verifyOtpTool.invoke({ email: emailToVerify, otp }, runConfig);
+  const verifyRes = await verifyOtpTool.invoke({ email, otp }, runConfig);
   const parsed = parseToolOutput(verifyRes);
 
   if (parsed.status !== 'verified') {
@@ -71,7 +71,7 @@ async function handleOtpVerificationFlow(params: {
   const scheduleRes = await scheduleEnquiryTool.invoke(
     {
       name: leadInfo.name,
-      email: emailToVerify,
+      email,
       phone: leadInfo.phone || 'Not provided',
       reason: leadInfo.reason || 'General portfolio consultation / enquiry',
     },
@@ -144,7 +144,10 @@ async function handleBookingOrOtpDispatchFlow(params: {
       ? `A 6-digit verification code has been dispatched to ${leadInfo.email}! 🔐 Please enter the code here to confirm. Vyshnav personally replies within 24 hours!`
       : `Failed to send verification code to ${leadInfo.email}. Please try again later.`;
 
-    return buildScheduleReply(replyMsg, leadInfo, { uiAction: otpParsed.uiAction ?? null });
+    return buildScheduleReply(replyMsg, leadInfo, {
+      isVerified: false,
+      uiAction: otpParsed.uiAction ?? null,
+    });
   }
 
   log.warn('schedule_enquiry returned unexpected status', { status: scheduleParsed.status });
@@ -211,8 +214,25 @@ export async function scheduleEnquiryNode(
       hasOtp: Boolean(extracted.otp),
     });
 
-    if (extracted.otp && (extracted.action === 'verify_otp' || !state.isVerified)) {
+    const emailChanged = Boolean(
+      extracted.email &&
+        state.leadInfo?.email &&
+        extracted.email.toLowerCase().trim() !== state.leadInfo.email.toLowerCase().trim()
+    );
+    const effectiveIsVerified = emailChanged ? false : Boolean(state.isVerified);
+
+    if (extracted.otp && (extracted.action === 'verify_otp' || !effectiveIsVerified)) {
+      if (!mergedLeadInfo.email) {
+        log.warn('OTP provided without email address in session or message');
+        log.done({ outcome: 'otp_missing_email' });
+        return buildScheduleReply(
+          'Please share the email address associated with your verification code so I can verify it.',
+          mergedLeadInfo
+        );
+      }
+
       return await handleOtpVerificationFlow({
+        email: mergedLeadInfo.email,
         otp: extracted.otp,
         leadInfo: mergedLeadInfo,
         log,

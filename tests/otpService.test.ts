@@ -89,4 +89,22 @@ describe('OTP Service', () => {
     expect(result.success).toBe(false);
     expect(result.message).toContain('No active OTP found or it has expired');
   });
+
+  it('should invalidate OTP after 5 failed attempts even under parallel verification requests', async () => {
+    const otp = '778899';
+    await storeHashedOtp(testEmail, otp);
+
+    const parallelResults = await Promise.all(
+      Array.from({ length: 8 }, () => verifyEnteredOtp(testEmail, '000000'))
+    );
+
+    const invalidated = parallelResults.filter((r) =>
+      r.message.includes('Too many incorrect attempts')
+    );
+    expect(invalidated.length).toBeGreaterThanOrEqual(4);
+    expect(redisStore.has(`otp:${testEmail}`)).toBe(false);
+
+    const lateValidAttempt = await verifyEnteredOtp(testEmail, otp);
+    expect(lateValidAttempt.success).toBe(false);
+  });
 });

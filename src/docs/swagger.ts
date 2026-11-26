@@ -21,6 +21,15 @@ export const swaggerDocument = {
       description: 'Local Development Server',
     },
   ],
+  components: {
+    securitySchemes: {
+      AdminApiKey: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'x-api-key',
+      },
+    },
+  },
   paths: {
     '/api/chat/stream': {
       post: {
@@ -149,7 +158,7 @@ export const swaggerDocument = {
                     },
                     intent: {
                       type: 'string',
-                      enum: ['profile_query', 'schedule_enquiry', 'general_chat'],
+                      enum: ['profile_query', 'greeting', 'schedule_enquiry', 'out_of_scope', 'direct'],
                       description: 'Classified user intent.',
                     },
                     retrievedCount: {
@@ -265,6 +274,7 @@ export const swaggerDocument = {
     '/api/ingest': {
       post: {
         tags: ['Knowledge Base'],
+        security: [{ AdminApiKey: [] }],
         summary: 'Index resume PDF into PostgreSQL pgvector',
         description:
           'Reads the resume PDF, chunks the text into semantic sections, generates vector embeddings, and atomically replaces rows in the `resume_chunks` pgvector table.',
@@ -303,6 +313,7 @@ export const swaggerDocument = {
     '/api/enquiries': {
       get: {
         tags: ['Enquiries & Leads'],
+        security: [{ AdminApiKey: [] }],
         summary: 'List verified scheduled meeting enquiries',
         description:
           'Fetches the list of all confirmed consultation leads stored in Redis that have passed OTP email verification.',

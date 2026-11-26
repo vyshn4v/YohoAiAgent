@@ -1,9 +1,44 @@
-import { Router, Request, Response } from 'express';
+import crypto from 'crypto';
+import { NextFunction, Request, Response, Router } from 'express';
 import swaggerUi from 'swagger-ui-express';
 import { config } from '../../config/index.js';
 import { swaggerDocument } from '../../docs/swagger.js';
 import { ingestResumePdf } from '../../scripts/ingestResumePdf.js';
 import { redisClient } from '../../services/redisClient.js';
+
+function timingSafeMatch(provided: string, expected: string): boolean {
+  const providedHash = crypto.createHash('sha256').update(provided).digest();
+  const expectedHash = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(providedHash, expectedHash);
+}
+
+function extractAdminToken(req: Request): string {
+  const apiKeyHeader = req.headers['x-api-key'];
+  if (typeof apiKeyHeader === 'string' && apiKeyHeader.trim()) {
+    return apiKeyHeader.trim();
+  }
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === 'string' && authHeader.toLowerCase().startsWith('bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  return '';
+}
+
+function requireAdminAuth(req: Request, res: Response, next: NextFunction): void {
+  const configuredKey = process.env.ADMIN_API_KEY || config.adminApiKey;
+  if (!configuredKey) {
+    res.status(503).json({ error: 'Admin API key is not configured.' });
+    return;
+  }
+
+  const providedToken = extractAdminToken(req);
+  if (!providedToken || !timingSafeMatch(providedToken, configuredKey)) {
+    res.status(401).json({ error: 'Unauthorized.' });
+    return;
+  }
+
+  next();
+}
 
 export function createSystemRouter(): Router {
   const router = Router();
@@ -53,7 +88,7 @@ export function createSystemRouter(): Router {
     });
   });
 
-  router.post('/api/ingest', async (_req: Request, res: Response) => {
+  router.post('/api/ingest', requireAdminAuth, async (_req: Request, res: Response) => {
     try {
       const result = await ingestResumePdf();
       res.json(result);
@@ -62,14 +97,16 @@ export function createSystemRouter(): Router {
     }
   });
 
-  router.get('/api/enquiries', async (_req: Request, res: Response) => {
+  router.get('/api/enquiries', requireAdminAuth, async (_req: Request, res: Response) => {
     try {
       const ids = await redisClient.lrange('enquiries:list', 0, 50);
-      const enquiries = [];
-      for (const id of ids) {
-        const data = await redisClient.get(`enquiry:${id}`);
-        if (data) {
-          enquiries.push(JSON.parse(data));
+      const enquiries: Record<string, any>[] = [];
+      if (ids.length > 0) {
+        const values = await redisClient.mget(ids.map((id) => `enquiry:${id}`));
+        for (const data of values) {
+          if (data) {
+            enquiries.push(JSON.parse(data));
+          }
         }
       }
       res.json({ count: enquiries.length, enquiries });

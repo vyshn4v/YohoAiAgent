@@ -46,7 +46,7 @@ export function createChatRouter(): Router {
         return;
       }
 
-      const session = getConversationSession(conversationId);
+      const session = await getConversationSession(conversationId);
       log = createNodeLogger('Server:Chat', conversationId);
       log.start({ messageLen: message.length, historyCount: session.messages.length });
 
@@ -71,7 +71,7 @@ export function createChatRouter(): Router {
 
       const mergedLeadInfo = { ...session.leadInfo, ...(finalState.leadInfo || {}) };
       const finalIsVerified = Boolean(finalState.isVerified ?? session.isVerified);
-      saveConversationSession(
+      await saveConversationSession(
         conversationId,
         [...updatedHistory, new AIMessage(replyText)],
         mergedLeadInfo,

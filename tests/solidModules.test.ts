@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import { redisClient } from '../src/services/redisClient.js';
 import {
   buildDecisionInput,
   extractConversationalReply,
@@ -19,6 +20,7 @@ import {
 
 describe('SOLID Module Unit Tests', () => {
   beforeEach(() => {
+    vi.restoreAllMocks();
     clearConversationSessions();
   });
 
@@ -55,22 +57,52 @@ describe('SOLID Module Unit Tests', () => {
   });
 
   describe('sessionStore', () => {
-    it('stores and retrieves messages, leadInfo, and isVerified across turns', () => {
-      const initial = getConversationSession('sess-1');
+    it('persists messages, leadInfo, and isVerified in Redis and reconstructs message instances', async () => {
+      const store = new Map<string, string>();
+      vi.spyOn(redisClient, 'get').mockImplementation(async (key: any) => store.get(key) ?? null);
+      const setSpy = vi
+        .spyOn(redisClient, 'set')
+        .mockImplementation(async (key: any, val: any) => {
+          store.set(key, String(val));
+          return 'OK' as any;
+        });
+
+      const initial = await getConversationSession('sess-1');
       expect(initial.messages).toEqual([]);
       expect(initial.isVerified).toBe(false);
 
-      saveConversationSession(
+      await saveConversationSession(
         'sess-1',
         [new HumanMessage('hi'), new AIMessage('hello')],
         { name: 'Alice', email: 'alice@example.com' },
         true
       );
 
-      const loaded = getConversationSession('sess-1');
+      expect(setSpy).toHaveBeenCalledWith('session:sess-1', expect.any(String), 'EX', 86400);
+
+      const loaded = await getConversationSession('sess-1');
       expect(loaded.messages).toHaveLength(2);
+      expect(loaded.messages[0]).toBeInstanceOf(HumanMessage);
+      expect(loaded.messages[1]).toBeInstanceOf(AIMessage);
       expect(loaded.leadInfo.name).toBe('Alice');
       expect(loaded.isVerified).toBe(true);
+    });
+
+    it('falls back safely to in-memory storage when Redis errors', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(redisClient, 'get').mockRejectedValue(new Error('Redis down'));
+      vi.spyOn(redisClient, 'set').mockRejectedValue(new Error('Redis down'));
+
+      await saveConversationSession(
+        'sess-fallback',
+        [new HumanMessage('hi')],
+        { name: 'Bob' },
+        false
+      );
+
+      const loaded = await getConversationSession('sess-fallback');
+      expect(loaded.messages).toHaveLength(1);
+      expect(loaded.leadInfo.name).toBe('Bob');
     });
   });
 

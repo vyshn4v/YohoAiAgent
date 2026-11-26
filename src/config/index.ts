@@ -60,13 +60,9 @@ const resolvedProvider =
     ? 'nvidia'
     : 'openrouter');
 
-const providerConfigs: Record<string, { apiKey: string; model: string; baseUrl: string; [key: string]: any }> = {
+const providerConfigs: Record<string, { apiKey: string; model: string; baseUrl: string }> = {
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || '',
-    decisionModel: process.env.GEMINI_DECISION_MODEL || 'gemini-decision-1',
-    greetingModel: process.env.GEMINI_GREETING_MODEL || 'gemini-flash-lite-latest',
-    bigModel: process.env.GEMINI_BIG_MODEL || 'gemini-3.5-flash-lite',
-    embeddingModel: process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2',
     model: process.env.GEMINI_MODEL || 'gemini-flash-latest',
     baseUrl: process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai/',
   },
@@ -101,8 +97,6 @@ export const config = {
   },
 
   gemini: providerConfigs.gemini,
-  groq: providerConfigs.groq,
-  nvidia: providerConfigs.nvidia,
 
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY || '',
@@ -129,6 +123,7 @@ export const config = {
   },
 
   hostEmail: process.env.HOST_EMAIL || 'vyshnav@example.com',
+  adminApiKey: process.env.ADMIN_API_KEY || '',
 
   langsmith: langsmithConfig,
 

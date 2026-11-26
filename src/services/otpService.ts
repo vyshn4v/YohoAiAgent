@@ -67,9 +67,9 @@ export async function verifyEnteredOtp(
     };
   }
 
-  // Check attempt limit
-  const attempts = parseInt((await redisClient.get(attemptsKey)) || '0', 10);
-  if (attempts >= MAX_ATTEMPTS) {
+  // Increment attempt counter atomically before hash comparison to prevent parallel brute-force races
+  const attempts = await redisClient.incr(attemptsKey);
+  if (attempts > MAX_ATTEMPTS) {
     await redisClient.del(otpKey);
     await redisClient.del(attemptsKey);
     return {
@@ -89,8 +89,15 @@ export async function verifyEnteredOtp(
     crypto.timingSafeEqual(storedBuf, enteredBuf);
 
   if (!isMatch) {
-    await redisClient.incr(attemptsKey);
-    const remaining = MAX_ATTEMPTS - (attempts + 1);
+    const remaining = MAX_ATTEMPTS - attempts;
+    if (remaining <= 0) {
+      await redisClient.del(otpKey);
+      await redisClient.del(attemptsKey);
+      return {
+        success: false,
+        message: 'Too many incorrect attempts. For security, your OTP was invalidated. Please request a new code.',
+      };
+    }
     return {
       success: false,
       message: `Invalid code. ${remaining} attempt(s) remaining.`,

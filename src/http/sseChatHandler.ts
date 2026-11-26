@@ -55,7 +55,7 @@ export async function handleSseChatStream(
   let activeNode = 'graph_init';
 
   try {
-    const session = getConversationSession(conversationId);
+    const session = await getConversationSession(conversationId);
     log.start({ messageLen: message.length, historyCount: session.messages.length });
     sendEvent('status', { status: 'starting', conversationId });
 
@@ -119,7 +119,7 @@ export async function handleSseChatStream(
 
     // Avoid saving empty AIMessage("") turns when client disconnects before completion
     if (!isClientDisconnected && fullReply) {
-      saveConversationSession(
+      await saveConversationSession(
         conversationId,
         [...updatedHistory, new AIMessage(fullReply)],
         finalLeadInfo,

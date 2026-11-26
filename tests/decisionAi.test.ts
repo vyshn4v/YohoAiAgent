@@ -5,10 +5,13 @@ import {
   getGoogleGenAiClient,
   greetingSmallModelNode,
   pgVectorRetrieverNode,
+  scheduleEnquiryNode,
 } from '../src/agent/nodes.js';
 import { agentGraph } from '../src/agent/graph.js';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import * as pgVectorService from '../src/services/pgVectorService.js';
+import * as otpService from '../src/services/otpService.js';
+import * as emailQueue from '../src/queues/emailQueue.js';
 
 describe('Decision AI & 4-Tier Model Routing', () => {
   beforeEach(() => {
@@ -67,6 +70,22 @@ describe('Decision AI & 4-Tier Model Routing', () => {
       const state = {
         messages: [new HumanMessage('Where did you study?')],
         extractedKeywords: 'education college degree',
+      };
+
+      const result = await pgVectorRetrieverNode(state as any);
+
+      expect(result.retrievedDocs).toEqual([]);
+    });
+
+    it('should return empty docs cleanly when pgvector search throws an error', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(pgVectorService, 'searchResumeChunks').mockRejectedValueOnce(
+        new Error('DB connection lost')
+      );
+
+      const state = {
+        messages: [new HumanMessage('Tell me about Neutrinos')],
+        extractedKeywords: 'Neutrinos experience',
       };
 
       const result = await pgVectorRetrieverNode(state as any);
@@ -152,6 +171,80 @@ describe('Decision AI & 4-Tier Model Routing', () => {
           input: expect.stringContaining('Latest user message: "Vyshnav"'),
         })
       );
+    });
+  });
+
+  describe('scheduleEnquiryNode OTP & email state edge cases', () => {
+    it('asks for email instead of falling back to user@example.com when OTP has no email', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const verifySpy = vi.spyOn(otpService, 'verifyEnteredOtp');
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alex',
+          email: null,
+          phone: null,
+          reason: null,
+          otp: '654321',
+          action: 'verify_otp',
+        }),
+      } as any);
+
+      const result = await scheduleEnquiryNode({
+        messages: [new HumanMessage('654321')],
+        leadInfo: { name: 'Alex' },
+        isVerified: false,
+      } as any);
+
+      expect(verifySpy).not.toHaveBeenCalled();
+      expect(String(result.messages![0].content)).toContain('email address');
+    });
+
+    it('resets isVerified on email change and verifies subsequent OTP regardless of action label', async () => {
+      vi.spyOn(otpService, 'isEmailVerified').mockResolvedValueOnce(false);
+      vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValueOnce('hashed');
+      vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValueOnce('job-bob' as any);
+
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alice',
+          email: 'bob@example.com',
+          phone: null,
+          reason: null,
+          otp: null,
+          action: 'send_otp',
+        }),
+      } as any);
+
+      const dispatchRes = await scheduleEnquiryNode({
+        messages: [new HumanMessage('Use bob@example.com instead')],
+        leadInfo: { name: 'Alice', email: 'alice@example.com' },
+        isVerified: true,
+      } as any);
+
+      expect(dispatchRes.isVerified).toBe(false);
+
+      const verifySpy = vi.spyOn(otpService, 'verifyEnteredOtp').mockResolvedValueOnce({
+        success: false,
+        message: 'Invalid code.',
+      });
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alice',
+          email: 'bob@example.com',
+          phone: null,
+          reason: null,
+          otp: '456789',
+          action: 'schedule',
+        }),
+      } as any);
+
+      await scheduleEnquiryNode({
+        messages: [new HumanMessage('456789')],
+        leadInfo: { name: 'Alice', email: 'bob@example.com' },
+        isVerified: Boolean(dispatchRes.isVerified),
+      } as any);
+
+      expect(verifySpy).toHaveBeenCalledWith('bob@example.com', '456789');
     });
   });
 });
