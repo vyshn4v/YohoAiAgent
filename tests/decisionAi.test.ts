@@ -7,7 +7,7 @@ import {
   pgVectorRetrieverNode,
 } from '../src/agent/nodes.js';
 import { agentGraph } from '../src/agent/graph.js';
-import { HumanMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import * as pgVectorService from '../src/services/pgVectorService.js';
 
 describe('Decision AI & 4-Tier Model Routing', () => {
@@ -123,6 +123,36 @@ describe('Decision AI & 4-Tier Model Routing', () => {
       expect(outOfScopeText).toContain('Vyshnav P C');
       expect(vectorSpy).not.toHaveBeenCalled();
       expect(llmSpy).not.toHaveBeenCalled();
+    });
+
+    it('passes previous assistant message context to decision model for follow-up name replies', async () => {
+      const ai = getGoogleGenAiClient();
+      const createSpy = vi.spyOn(ai.decisions, 'create').mockResolvedValueOnce({
+        answers: { intent: { type: 'choice', choice: 'schedule_enquiry', confidence: 0.98 } },
+      } as any);
+
+      const state = {
+        messages: [
+          new HumanMessage('my email is alex@example.com'),
+          new AIMessage('Could you please share your name as well? Vyshnav personally replies within 24 hours.'),
+          new HumanMessage('Vyshnav'),
+        ],
+      };
+
+      const result = await decisionRouterNode(state as any);
+
+      expect(result.intent).toBe('schedule_enquiry');
+      expect(result.extractedKeywords).toBe('Vyshnav');
+      expect(createSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.stringContaining('Previous assistant message:'),
+        })
+      );
+      expect(createSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.stringContaining('Latest user message: "Vyshnav"'),
+        })
+      );
     });
   });
 });

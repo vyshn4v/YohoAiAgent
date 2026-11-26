@@ -61,6 +61,7 @@ app.get('/', (_req: Request, res: Response) => {
 interface SessionData {
   messages: BaseMessage[];
   leadInfo: LeadInfo;
+  isVerified: boolean;
   updatedAt: number;
 }
 
@@ -73,20 +74,21 @@ function getConversationSession(conversationId: string): SessionData {
   if (session) {
     if (Date.now() - session.updatedAt > SESSION_TTL_MS) {
       conversationSessions.delete(conversationId);
-      return { messages: [], leadInfo: {}, updatedAt: Date.now() };
+      return { messages: [], leadInfo: {}, isVerified: false, updatedAt: Date.now() };
     }
     // Refresh access order (LRU)
     conversationSessions.delete(conversationId);
     conversationSessions.set(conversationId, session);
     return session;
   }
-  return { messages: [], leadInfo: {}, updatedAt: Date.now() };
+  return { messages: [], leadInfo: {}, isVerified: false, updatedAt: Date.now() };
 }
 
 function saveConversationSession(
   conversationId: string,
   messages: BaseMessage[],
-  leadInfo: LeadInfo
+  leadInfo: LeadInfo,
+  isVerified = false
 ): void {
   // Evict oldest session if capacity reached
   if (conversationSessions.size >= MAX_SESSIONS) {
@@ -96,6 +98,7 @@ function saveConversationSession(
   conversationSessions.set(conversationId, {
     messages,
     leadInfo,
+    isVerified,
     updatedAt: Date.now(),
   });
 }
@@ -208,10 +211,15 @@ async function handleSseChatStream(
     let intent = 'profile_query';
     let tokensStreamed = 0;
     let finalLeadInfo: LeadInfo = { ...session.leadInfo };
+    let finalIsVerified = session.isVerified;
     let finalUiAction: Record<string, any> | null = null;
 
     const stream = agentGraph.streamEvents(
-      { messages: updatedHistory, leadInfo: session.leadInfo },
+      {
+        messages: updatedHistory,
+        leadInfo: session.leadInfo,
+        isVerified: session.isVerified,
+      },
       {
         version: 'v2',
         runName: 'PortfolioAgentChat',
@@ -255,6 +263,9 @@ async function handleSseChatStream(
         if (finalState?.leadInfo) {
           finalLeadInfo = { ...finalLeadInfo, ...finalState.leadInfo };
         }
+        if (typeof finalState?.isVerified === 'boolean') {
+          finalIsVerified = finalState.isVerified;
+        }
         if (finalState?.uiAction !== undefined) {
           finalUiAction = finalState.uiAction;
         }
@@ -290,11 +301,12 @@ async function handleSseChatStream(
       }
     }
 
-    // Save history and leadInfo
+    // Save history, leadInfo, and verification status
     saveConversationSession(
       conversationId,
       [...updatedHistory, new AIMessage(fullReply)],
-      finalLeadInfo
+      finalLeadInfo,
+      finalIsVerified
     );
 
     if (finalUiAction) {
@@ -397,6 +409,7 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
       {
         messages: updatedHistory,
         leadInfo: session.leadInfo,
+        isVerified: session.isVerified,
       },
       {
         runName: 'PortfolioAgentChat',
@@ -422,12 +435,14 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
       // Clean text already
     }
 
-    // Save updated history and leadInfo
+    // Save updated history, leadInfo, and verification status
     const mergedLeadInfo = { ...session.leadInfo, ...(finalState.leadInfo || {}) };
+    const finalIsVerified = Boolean(finalState.isVerified ?? session.isVerified);
     saveConversationSession(
       conversationId,
       [...updatedHistory, new AIMessage(replyText)],
-      mergedLeadInfo
+      mergedLeadInfo,
+      finalIsVerified
     );
 
     const uiAction = finalState.uiAction || null;

@@ -117,6 +117,31 @@ function invokeTraceable<Args extends any[], Res>(
     : tracedFn(...args);
 }
 
+function buildDecisionInput(messages: BaseMessage[], lastUserMessage: string): string {
+  let lastHumanIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] instanceof HumanMessage || messages[i]._getType() === 'human') {
+      lastHumanIdx = i;
+      break;
+    }
+  }
+
+  for (let i = lastHumanIdx >= 0 ? lastHumanIdx - 1 : messages.length - 1; i >= 0; i--) {
+    if (messages[i] instanceof AIMessage || messages[i]._getType() === 'ai') {
+      const prevContent =
+        typeof messages[i].content === 'string'
+          ? (messages[i].content as string).trim()
+          : JSON.stringify(messages[i].content);
+      if (prevContent) {
+        return `Previous assistant message: "${prevContent}"\nLatest user message: "${lastUserMessage}"`;
+      }
+      break;
+    }
+  }
+
+  return lastUserMessage;
+}
+
 /**
  * Decision Node: Calls gemini-decision-1 via official @google/genai SDK (Zero LLM)
  * If failed, returns error message to user to try again later.
@@ -132,13 +157,13 @@ async function callDecisionModel(message: string): Promise<DecisionIntent> {
       intent: {
         type: 'choice',
         instructions:
-          'Classify the user message into the single best intent. Choose out_of_scope for math (e.g. 1+1), trivia, general knowledge, coding help, or anything unrelated to Vyshnav P C, greetings, or scheduling.',
+          'Classify the latest user message intent using the previous assistant message (if present) as context. Choose schedule_enquiry if the user is answering the assistant\'s previous request for name, email, phone, reason, or OTP. Choose out_of_scope for math (e.g. 1+1), trivia, general knowledge, coding help, or anything unrelated to Vyshnav P C, greetings, or scheduling.',
         criteria: {
-          greeting: 'Casual greeting or pleasantry like hi, hello, hey',
+          greeting: 'Casual greeting or pleasantry like hi, hello, hey (when not answering a scheduling prompt)',
           schedule_enquiry:
-            'Scheduling or requesting a meeting/consultation, sharing contact details, or entering a 6-digit OTP verification code',
+            'Scheduling or requesting a meeting/consultation, sharing contact details (name, email, phone, reason), entering a 6-digit OTP verification code, or replying directly to the assistant\'s previous scheduling/OTP question',
           knowledge_query:
-            'Questions about Vyshnav skills, experience, projects, education, or resume',
+            'Questions asking about Vyshnav skills, experience, projects, education, or resume',
           out_of_scope:
             'Anything unrelated to Vyshnav P C or scheduling, such as math equations (1+1), trivia, weather, general Q&A, or coding tasks',
         },
@@ -203,7 +228,8 @@ export async function decisionRouterNode(
   });
 
   try {
-    const intent = await invokeTraceable(tracedCallDecisionModel, runConfig, lastMessage);
+    const decisionInput = buildDecisionInput(state.messages, lastMessage);
+    const intent = await invokeTraceable(tracedCallDecisionModel, runConfig, decisionInput);
     const mappedIntent = intent === 'knowledge_query' ? 'profile_query' : intent;
     const nextNode =
       mappedIntent === 'greeting'
@@ -277,7 +303,8 @@ export async function scheduleEnquiryNode(
     const conversationContext = state.messages
       .map((m) => `${m._getType() === 'human' ? 'User' : 'Assistant'}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`)
       .join('\n');
-    const extracted = await extractor.invoke(conversationContext || lastMessage, runConfig);
+    const extractionPrompt = `Extract the visitor's own contact details (name, email, phone, reason, otp) from the conversation below. Note: Vyshnav P C is the portfolio owner; if the visitor provides their own name when asked (even if it is Vyshnav), extract it as name.\n\n${conversationContext || lastMessage}`;
+    const extracted = await extractor.invoke(extractionPrompt, runConfig);
 
     const mergedLeadInfo: LeadInfo = {
       ...state.leadInfo,

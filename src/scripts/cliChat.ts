@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { HumanMessage, AIMessage, BaseMessage } from '@langchain/core/messages';
 import { awaitAllCallbacks } from '@langchain/core/callbacks/promises';
 import { agentGraph } from '../agent/graph.js';
+import { LeadInfo } from '../agent/state.js';
 import { startEmailWorker } from '../workers/emailWorker.js';
 
 console.log('=================================================================');
@@ -20,6 +21,8 @@ try {
 
 const conversationId = uuidv4();
 const history: BaseMessage[] = [];
+let leadInfo: LeadInfo = {};
+let isVerified = false;
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -46,13 +49,20 @@ async function promptUser() {
     try {
       console.log('Agent is thinking (running LangGraph pipeline)...');
       const result = await agentGraph.invoke(
-        { messages: history },
+        { messages: history, leadInfo, isVerified },
         {
           runName: 'PortfolioAgentCLI',
           configurable: { thread_id: conversationId },
           metadata: { conversationId, session_id: conversationId },
         }
       );
+
+      if (result.leadInfo) {
+        leadInfo = { ...leadInfo, ...result.leadInfo };
+      }
+      if (typeof result.isVerified === 'boolean') {
+        isVerified = result.isVerified;
+      }
 
       const lastAiMessage = result.messages[result.messages.length - 1];
       const reply =
