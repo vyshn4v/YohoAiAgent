@@ -12,50 +12,7 @@ import { queryPinecone } from '../services/pineconeService.js';
 import { redisClient } from '../services/redisClient.js';
 
 /**
- * Tool 1: request_contact_details
- * Prompts the user with an interactive contact form to collect missing details.
- */
-export const requestContactDetailsTool = tool(
-  async ({ fields, message }) => {
-    const formattedFields = fields.map((f) => ({
-      name: f,
-      type: f === 'email' ? 'email' : f === 'phone' ? 'tel' : 'text',
-      label:
-        f === 'name'
-          ? 'Full Name'
-          : f === 'email'
-          ? 'Email Address'
-          : f === 'phone'
-          ? 'Phone Number'
-          : 'Reason for Meeting',
-      required: true,
-    }));
-
-    return JSON.stringify({
-      status: 'form_requested',
-      message: message || 'Please provide your details so we can proceed with your request.',
-      uiAction: {
-        type: 'form_input',
-        title: 'Enter Your Details',
-        fields: formattedFields,
-      },
-    });
-  },
-  {
-    name: 'request_contact_details',
-    description:
-      'Call this tool when the user wants to schedule a meeting, connect, or book, but has not yet provided required contact details (such as Full Name and/or Email Address). Displays an interactive input form in the chat.',
-    schema: z.object({
-      fields: z
-        .array(z.enum(['name', 'email', 'phone', 'reason']))
-        .describe('List of fields needed from the user, e.g. ["name", "email"].'),
-      message: z.string().optional().nullable().describe('Friendly explanation to the user why these fields are needed.'),
-    }),
-  }
-);
-
-/**
- * Tool 2: send_verification_otp
+ * Tool 1: send_verification_otp
  * Generates a 6-digit OTP, stores it in encrypted/hashed form in Redis,
  * and enqueues the email delivery job to BullMQ.
  */
@@ -228,7 +185,6 @@ export const searchPineconeTool = tool(
 );
 
 export const agentTools = [
-  requestContactDetailsTool,
   sendVerificationOtpTool,
   verifyOtpTool,
   scheduleEnquiryTool,

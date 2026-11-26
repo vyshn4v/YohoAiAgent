@@ -1,7 +1,13 @@
 import crypto from 'crypto';
 import { redisClient } from './redisClient.js';
 
-const OTP_SECRET = process.env.OTP_SECRET || 'agent_otp_secure_salt_key_2026';
+const OTP_SECRET =
+  process.env.OTP_SECRET ||
+  (process.env.NODE_ENV === 'production'
+    ? (() => {
+        throw new Error('FATAL: OTP_SECRET environment variable must be set in production.');
+      })()
+    : 'agent_otp_secure_salt_key_2026');
 const OTP_TTL_SECONDS = 300; // 5 minutes
 const VERIFIED_TTL_SECONDS = 3600; // 1 hour
 const MAX_ATTEMPTS = 5;

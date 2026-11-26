@@ -2,3 +2,10 @@ node_modules
 dist
 .env
 *.log
+
+# Change request local tracking (Rule 8)
+CHANGE_REQUEST.md
+
+# Graphify local output & cache
+graphify-out/
+

@@ -14,7 +14,7 @@ import { swaggerDocument } from './docs/swagger.js';
 
 export const app = express();
 
-// Enhanced CORS supporting cross-domain and cross-subdomain frontends
+// Enhanced CORS supporting cross-domain frontends with OWASP best practices
 const configuredOrigins =
   config.cors.origin === '*'
     ? '*'
@@ -27,8 +27,8 @@ app.use(
       if (!origin) return callback(null, true);
       if (configuredOrigins === '*') return callback(null, true);
       if (configuredOrigins.includes(origin)) return callback(null, true);
-      // Permissive fallback so any frontend domain or subdomain works smoothly
-      return callback(null, true);
+      // Deny origins not listed in the whitelist
+      return callback(null, false);
     },
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: [
@@ -39,7 +39,7 @@ app.use(
       'Accept',
     ],
     exposedHeaders: ['Content-Type'],
-    credentials: true,
+    credentials: configuredOrigins !== '*',
   })
 );
 
@@ -56,13 +56,48 @@ app.get('/', (_req: Request, res: Response) => {
   res.redirect('/api/docs');
 });
 
-// In-memory conversation state store (session cache)
+// Bounded in-memory conversation state store (session cache with LRU & TTL eviction)
 interface SessionData {
   messages: BaseMessage[];
   leadInfo: LeadInfo;
+  updatedAt: number;
 }
 
+const MAX_SESSIONS = 500;
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const conversationSessions = new Map<string, SessionData>();
+
+function getConversationSession(conversationId: string): SessionData {
+  const session = conversationSessions.get(conversationId);
+  if (session) {
+    if (Date.now() - session.updatedAt > SESSION_TTL_MS) {
+      conversationSessions.delete(conversationId);
+      return { messages: [], leadInfo: {}, updatedAt: Date.now() };
+    }
+    // Refresh access order (LRU)
+    conversationSessions.delete(conversationId);
+    conversationSessions.set(conversationId, session);
+    return session;
+  }
+  return { messages: [], leadInfo: {}, updatedAt: Date.now() };
+}
+
+function saveConversationSession(
+  conversationId: string,
+  messages: BaseMessage[],
+  leadInfo: LeadInfo
+): void {
+  // Evict oldest session if capacity reached
+  if (conversationSessions.size >= MAX_SESSIONS) {
+    const oldestKey = conversationSessions.keys().next().value;
+    if (oldestKey) conversationSessions.delete(oldestKey);
+  }
+  conversationSessions.set(conversationId, {
+    messages,
+    leadInfo,
+    updatedAt: Date.now(),
+  });
+}
 
 /**
  * Health check endpoint
@@ -125,8 +160,12 @@ async function handleSseChatStream(
 
   const requestOrigin = req.headers.origin;
   if (requestOrigin) {
-    res.setHeader('Access-Control-Allow-Origin', requestOrigin);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    if (configuredOrigins === '*' || configuredOrigins.includes(requestOrigin)) {
+      res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+      if (configuredOrigins !== '*') {
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      }
+    }
   } else {
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
@@ -156,10 +195,7 @@ async function handleSseChatStream(
   try {
     sendEvent('status', { status: 'starting', conversationId });
 
-    const session = conversationSessions.get(conversationId) || {
-      messages: [],
-      leadInfo: {},
-    };
+    const session = getConversationSession(conversationId);
     const userMessage = new HumanMessage(message);
     const updatedHistory = [...session.messages, userMessage];
 
@@ -237,10 +273,11 @@ async function handleSseChatStream(
     }
 
     // Save history and leadInfo
-    conversationSessions.set(conversationId, {
-      messages: [...updatedHistory, new AIMessage(fullReply)],
-      leadInfo: finalLeadInfo,
-    });
+    saveConversationSession(
+      conversationId,
+      [...updatedHistory, new AIMessage(fullReply)],
+      finalLeadInfo
+    );
 
     if (finalUiAction) {
       sendEvent('ui_action', finalUiAction);
@@ -255,8 +292,14 @@ async function handleSseChatStream(
       uiAction: finalUiAction,
     });
   } catch (err: any) {
+    console.error('[SSE Stream Error]', err);
     if (!isClientDisconnected && !res.writableEnded) {
-      sendEvent('error', { error: err.message || 'Stream processing failed' });
+      sendEvent('error', {
+        error:
+          process.env.NODE_ENV === 'development'
+            ? err.message || 'Stream processing failed'
+            : 'Stream processing failed',
+      });
     }
   } finally {
     clearInterval(heartbeat);
@@ -317,10 +360,7 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
     }
 
     // Standard JSON response
-    const session = conversationSessions.get(conversationId) || {
-      messages: [],
-      leadInfo: {},
-    };
+    const session = getConversationSession(conversationId);
     const userMessage = new HumanMessage(message);
     const updatedHistory = [...session.messages, userMessage];
 
@@ -349,10 +389,11 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
 
     // Save updated history and leadInfo
     const mergedLeadInfo = { ...session.leadInfo, ...(finalState.leadInfo || {}) };
-    conversationSessions.set(conversationId, {
-      messages: [...updatedHistory, new AIMessage(replyText)],
-      leadInfo: mergedLeadInfo,
-    });
+    saveConversationSession(
+      conversationId,
+      [...updatedHistory, new AIMessage(replyText)],
+      mergedLeadInfo
+    );
 
     const uiAction = finalState.uiAction || null;
 
@@ -368,7 +409,7 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
     console.error('[API Chat Error]', error);
     res.status(500).json({
       error: 'An error occurred while processing your request.',
-      details: error.message,
+      ...(process.env.NODE_ENV === 'development' ? { details: error.message } : {}),
     });
   }
 });
