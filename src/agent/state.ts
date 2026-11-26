@@ -14,7 +14,17 @@ export const AgentAnnotation = Annotation.Root({
     reducer: messagesStateReducer,
     default: () => [],
   }),
-  intent: Annotation<'profile_query' | 'schedule_enquiry' | 'general_chat' | 'direct' | 'knowledge'>({
+  intent: Annotation<
+    | 'greeting'
+    | 'profile_query'
+    | 'schedule_enquiry'
+    | 'general_chat'
+    | 'direct'
+    | 'out_of_scope'
+    | 'knowledge'
+    | 'knowledge_query'
+    | string
+  >({
     reducer: (_, next) => next,
     default: () => 'profile_query',
   }),

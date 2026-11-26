@@ -12,7 +12,7 @@ describe('End-to-End AI Multi-Turn Scheduling', () => {
       success: true,
       message: 'Email successfully verified!',
     });
-    vi.spyOn(otpService, 'isEmailVerified').mockResolvedValue(true);
+    vi.spyOn(otpService, 'isEmailVerified').mockResolvedValueOnce(false).mockResolvedValue(true);
     vi.spyOn(emailQueue, 'enqueueLeadNotification').mockResolvedValue('job-2' as any);
 
     // Turn 1: Providing email only without name

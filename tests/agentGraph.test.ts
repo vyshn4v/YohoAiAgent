@@ -7,7 +7,7 @@ import * as emailQueue from '../src/queues/emailQueue.js';
 describe('LangGraph Agent Multi-Node Orchestration', () => {
   beforeEach(async () => {
     vi.restoreAllMocks();
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, 500));
   });
 
   it('should process a profile inquiry through RAG nodes and respond with job details', async () => {

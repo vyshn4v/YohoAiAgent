@@ -11,6 +11,7 @@ import { startEmailWorker } from './workers/emailWorker.js';
 import { ingestProfileData } from './scripts/ingest.js';
 import { getPineconeClient } from './services/pineconeService.js';
 import { swaggerDocument } from './docs/swagger.js';
+import { createNodeLogger } from './utils/nodeLogger.js';
 
 export const app = express();
 
@@ -60,6 +61,7 @@ app.get('/', (_req: Request, res: Response) => {
 interface SessionData {
   messages: BaseMessage[];
   leadInfo: LeadInfo;
+  isVerified: boolean;
   updatedAt: number;
 }
 
@@ -72,20 +74,21 @@ function getConversationSession(conversationId: string): SessionData {
   if (session) {
     if (Date.now() - session.updatedAt > SESSION_TTL_MS) {
       conversationSessions.delete(conversationId);
-      return { messages: [], leadInfo: {}, updatedAt: Date.now() };
+      return { messages: [], leadInfo: {}, isVerified: false, updatedAt: Date.now() };
     }
     // Refresh access order (LRU)
     conversationSessions.delete(conversationId);
     conversationSessions.set(conversationId, session);
     return session;
   }
-  return { messages: [], leadInfo: {}, updatedAt: Date.now() };
+  return { messages: [], leadInfo: {}, isVerified: false, updatedAt: Date.now() };
 }
 
 function saveConversationSession(
   conversationId: string,
   messages: BaseMessage[],
-  leadInfo: LeadInfo
+  leadInfo: LeadInfo,
+  isVerified = false
 ): void {
   // Evict oldest session if capacity reached
   if (conversationSessions.size >= MAX_SESSIONS) {
@@ -95,6 +98,7 @@ function saveConversationSession(
   conversationSessions.set(conversationId, {
     messages,
     leadInfo,
+    isVerified,
     updatedAt: Date.now(),
   });
 }
@@ -192,10 +196,14 @@ async function handleSseChatStream(
     clearInterval(heartbeat);
   });
 
+  const log = createNodeLogger('Server:SSE', conversationId);
+  let activeNode = 'graph_init';
+
   try {
+    const session = getConversationSession(conversationId);
+    log.start({ messageLen: message.length, historyCount: session.messages.length });
     sendEvent('status', { status: 'starting', conversationId });
 
-    const session = getConversationSession(conversationId);
     const userMessage = new HumanMessage(message);
     const updatedHistory = [...session.messages, userMessage];
 
@@ -203,27 +211,45 @@ async function handleSseChatStream(
     let intent = 'profile_query';
     let tokensStreamed = 0;
     let finalLeadInfo: LeadInfo = { ...session.leadInfo };
+    let finalIsVerified = session.isVerified;
     let finalUiAction: Record<string, any> | null = null;
 
     const stream = agentGraph.streamEvents(
-      { messages: updatedHistory, leadInfo: session.leadInfo },
-      { version: 'v2' }
+      {
+        messages: updatedHistory,
+        leadInfo: session.leadInfo,
+        isVerified: session.isVerified,
+      },
+      {
+        version: 'v2',
+        runName: 'PortfolioAgentChat',
+        configurable: { thread_id: conversationId },
+        metadata: { conversationId, session_id: conversationId },
+      }
     );
 
     for await (const event of stream) {
-      if (isClientDisconnected) break;
+      if (isClientDisconnected) {
+        log.warn('Client disconnected mid-stream', { activeNode });
+        break;
+      }
 
       const node = event.metadata?.langgraph_node;
 
       // Status updates when nodes start
       if (event.event === 'on_chain_start') {
-        if (node === 'first_router_and_ui' || node === 'agent1_keyword_extractor') {
+        if (node) {
+          activeNode = node;
+        }
+        if (node === 'decision_router' || node === 'first_router_and_ui' || node === 'agent1_keyword_extractor') {
           sendEvent('status', { node, status: 'understanding_query' });
-        } else if (node === 'second_extractor' || node === 'agent2_relevance_classifier') {
+        } else if (node === 'greeting_small_model') {
+          sendEvent('status', { node, status: 'greeting' });
+        } else if (node === 'pgvector_retriever' || node === 'second_extractor' || node === 'agent2_relevance_classifier') {
           sendEvent('status', { node, status: 'extracting_facts' });
-        } else if (node === 'third_generator' || node === 'agent3_profile_synthesizer') {
+        } else if (node === 'knowledge_big_model' || node === 'third_generator' || node === 'agent3_profile_synthesizer') {
           sendEvent('status', { node, status: 'generating_answer' });
-        } else if (node === 'enquiry_coordinator') {
+        } else if (node === 'schedule_enquiry' || node === 'enquiry_coordinator') {
           sendEvent('status', { node, status: 'processing_enquiry' });
         }
       }
@@ -236,6 +262,9 @@ async function handleSseChatStream(
         }
         if (finalState?.leadInfo) {
           finalLeadInfo = { ...finalLeadInfo, ...finalState.leadInfo };
+        }
+        if (typeof finalState?.isVerified === 'boolean') {
+          finalIsVerified = finalState.isVerified;
         }
         if (finalState?.uiAction !== undefined) {
           finalUiAction = finalState.uiAction;
@@ -272,11 +301,12 @@ async function handleSseChatStream(
       }
     }
 
-    // Save history and leadInfo
+    // Save history, leadInfo, and verification status
     saveConversationSession(
       conversationId,
       [...updatedHistory, new AIMessage(fullReply)],
-      finalLeadInfo
+      finalLeadInfo,
+      finalIsVerified
     );
 
     if (finalUiAction) {
@@ -291,8 +321,14 @@ async function handleSseChatStream(
       leadInfo: finalLeadInfo,
       uiAction: finalUiAction,
     });
+    log.done({
+      intent,
+      replyLen: fullReply.length,
+      hasUiAction: Boolean(finalUiAction),
+      ...(isClientDisconnected ? { disconnected: true, activeNode } : {}),
+    });
   } catch (err: any) {
-    console.error('[SSE Stream Error]', err);
+    log.fail(err, { activeNode });
     if (!isClientDisconnected && !res.writableEnded) {
       sendEvent('error', {
         error:
@@ -345,6 +381,7 @@ app.get('/api/chat/stream', async (req: Request, res: Response): Promise<void> =
  * Body: { message: string, conversationId?: string }
  */
 app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
+  let log: ReturnType<typeof createNodeLogger> | undefined;
   try {
     const { message, conversationId = uuidv4() } = req.body;
 
@@ -361,14 +398,25 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
 
     // Standard JSON response
     const session = getConversationSession(conversationId);
+    log = createNodeLogger('Server:Chat', conversationId);
+    log.start({ messageLen: message.length, historyCount: session.messages.length });
+
     const userMessage = new HumanMessage(message);
     const updatedHistory = [...session.messages, userMessage];
 
     // Execute LangGraph multi-agent pipeline
-    const finalState = await agentGraph.invoke({
-      messages: updatedHistory,
-      leadInfo: session.leadInfo,
-    });
+    const finalState = await agentGraph.invoke(
+      {
+        messages: updatedHistory,
+        leadInfo: session.leadInfo,
+        isVerified: session.isVerified,
+      },
+      {
+        runName: 'PortfolioAgentChat',
+        configurable: { thread_id: conversationId },
+        metadata: { conversationId, session_id: conversationId },
+      }
+    );
 
     const lastAiMsg = finalState.messages[finalState.messages.length - 1];
     let replyText =
@@ -387,15 +435,19 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
       // Clean text already
     }
 
-    // Save updated history and leadInfo
+    // Save updated history, leadInfo, and verification status
     const mergedLeadInfo = { ...session.leadInfo, ...(finalState.leadInfo || {}) };
+    const finalIsVerified = Boolean(finalState.isVerified ?? session.isVerified);
     saveConversationSession(
       conversationId,
       [...updatedHistory, new AIMessage(replyText)],
-      mergedLeadInfo
+      mergedLeadInfo,
+      finalIsVerified
     );
 
     const uiAction = finalState.uiAction || null;
+    const retrievedCount = finalState.classifiedDocs?.length || finalState.retrievedDocs?.length || 0;
+    log.done({ intent: finalState.intent, retrievedCount, replyLen: replyText.length });
 
     res.json({
       reply: replyText,
@@ -403,10 +455,14 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
       intent: finalState.intent,
       leadInfo: mergedLeadInfo,
       uiAction,
-      retrievedCount: finalState.classifiedDocs?.length || finalState.retrievedDocs?.length || 0,
+      retrievedCount,
     });
   } catch (error: any) {
-    console.error('[API Chat Error]', error);
+    if (log) {
+      log.fail(error);
+    } else {
+      console.error('[API Chat Error]', error);
+    }
     res.status(500).json({
       error: 'An error occurred while processing your request.',
       ...(process.env.NODE_ENV === 'development' ? { details: error.message } : {}),
