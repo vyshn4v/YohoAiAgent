@@ -96,11 +96,16 @@ function getLastUserMessage(messages: BaseMessage[]): string {
   return '';
 }
 
+const OUT_OF_SCOPE_REPLY =
+  "I'm Yoho, Vyshnav P C's portfolio assistant. I can only answer questions about Vyshnav's skills, projects, experience, and background, or help schedule a consultation with him.";
+
+type DecisionIntent = 'greeting' | 'schedule_enquiry' | 'knowledge_query' | 'out_of_scope';
+
 /**
  * Decision Node: Calls gemini-decision-1 via official @google/genai SDK (Zero LLM)
  * If failed, returns error message to user to try again later.
  */
-async function callDecisionModel(message: string): Promise<'greeting' | 'schedule_enquiry' | 'knowledge_query'> {
+async function callDecisionModel(message: string): Promise<DecisionIntent> {
   const ai = getGoogleGenAiClient();
   const modelName = config.models.decision || 'gemini-decision-1';
 
@@ -110,13 +115,16 @@ async function callDecisionModel(message: string): Promise<'greeting' | 'schedul
     questions: {
       intent: {
         type: 'choice',
-        instructions: 'Classify the user message intent.',
+        instructions:
+          'Classify the user message into the single best intent. Choose out_of_scope for math (e.g. 1+1), trivia, general knowledge, coding help, or anything unrelated to Vyshnav P C, greetings, or scheduling.',
         criteria: {
           greeting: 'Casual greeting or pleasantry like hi, hello, hey',
           schedule_enquiry:
-            'Scheduling or requesting a meeting/consultation, sharing contact details, or entering an OTP code',
+            'Scheduling or requesting a meeting/consultation, sharing contact details, or entering a 6-digit OTP verification code',
           knowledge_query:
             'Questions about Vyshnav skills, experience, projects, education, or resume',
+          out_of_scope:
+            'Anything unrelated to Vyshnav P C or scheduling, such as math equations (1+1), trivia, weather, general Q&A, or coding tasks',
         },
       },
     },
@@ -124,7 +132,12 @@ async function callDecisionModel(message: string): Promise<'greeting' | 'schedul
 
   const intentAnswer = response?.answers?.intent;
   const choice = intentAnswer?.type === 'choice' ? intentAnswer.choice : undefined;
-  if (choice !== 'greeting' && choice !== 'schedule_enquiry' && choice !== 'knowledge_query') {
+  if (
+    choice !== 'greeting' &&
+    choice !== 'schedule_enquiry' &&
+    choice !== 'knowledge_query' &&
+    choice !== 'out_of_scope'
+  ) {
     throw new Error('Decision model returned invalid response');
   }
 
@@ -152,9 +165,21 @@ export async function decisionRouterNode(
         ? 'greeting_small_model'
         : mappedIntent === 'schedule_enquiry'
         ? 'schedule_enquiry'
+        : mappedIntent === 'out_of_scope'
+        ? 'END'
         : 'pgvector_retriever';
 
     log.done({ intent: mappedIntent, rawChoice: intent, nextNode });
+
+    if (mappedIntent === 'out_of_scope') {
+      return {
+        intent: 'out_of_scope',
+        finalMessage: OUT_OF_SCOPE_REPLY,
+        messages: [new AIMessage(OUT_OF_SCOPE_REPLY)],
+        uiAction: null,
+      };
+    }
+
     return {
       intent: mappedIntent,
       extractedKeywords: lastMessage,

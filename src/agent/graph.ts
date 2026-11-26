@@ -15,6 +15,7 @@ import {
  * START -> decision_router (Decision AI: gemini-decision-1)
  *        |-- (greeting) -> greeting_small_model (Small Model: gemini-flash-lite) -> END
  *        |-- (schedule_enquiry) -> schedule_enquiry (Small Model Contact Extractor + OTP/Booking) -> END
+ *        |-- (out_of_scope) -> END (Zero-AI deterministic scope boundary reply)
  *        |-- (knowledge_query) -> pgvector_retriever (Embeds with gemini-embedding-2 & queries PostgreSQL)
  *                                  -> knowledge_big_model (Big Model: gemini-3.5-flash-lite) -> END
  */
@@ -34,7 +35,7 @@ export function buildAgentGraph() {
     .addConditionalEdges(
       'decision_router',
       (state: AgentStateType) => {
-        if (state.intent === 'direct') {
+        if (state.intent === 'direct' || state.intent === 'out_of_scope') {
           return END;
         }
         if (state.intent === 'greeting') {

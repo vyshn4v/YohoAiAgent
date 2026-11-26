@@ -20,6 +20,7 @@ export const AgentAnnotation = Annotation.Root({
     | 'schedule_enquiry'
     | 'general_chat'
     | 'direct'
+    | 'out_of_scope'
     | 'knowledge'
     | 'knowledge_query'
     | string

@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { ChatOpenAI } from '@langchain/openai';
 import {
   decisionRouterNode,
   getGoogleGenAiClient,
   greetingSmallModelNode,
   pgVectorRetrieverNode,
 } from '../src/agent/nodes.js';
+import { agentGraph } from '../src/agent/graph.js';
 import { HumanMessage } from '@langchain/core/messages';
 import * as pgVectorService from '../src/services/pgVectorService.js';
 
@@ -101,6 +103,26 @@ describe('Decision AI & 4-Tier Model Routing', () => {
       expect(result.intent).toBe('direct');
       expect(result.finalMessage).toContain('An error occurred');
       expect(result.messages![0].content).toContain('Please try again later.');
+    });
+
+    it('should short-circuit out_of_scope requests without calling RAG or an LLM', async () => {
+      const ai = getGoogleGenAiClient();
+      vi.spyOn(ai.decisions, 'create').mockResolvedValue({
+        answers: { intent: { type: 'choice', choice: 'out_of_scope', confidence: 0.99 } },
+      } as any);
+      const vectorSpy = vi.spyOn(pgVectorService, 'searchResumeChunks');
+      const llmSpy = vi.spyOn(ChatOpenAI.prototype, 'invoke');
+
+      const result = await agentGraph.invoke({
+        messages: [new HumanMessage('1+1')],
+      });
+
+      expect(result.intent).toBe('out_of_scope');
+      expect(String(result.messages[result.messages.length - 1].content)).toContain(
+        'Vyshnav P C'
+      );
+      expect(vectorSpy).not.toHaveBeenCalled();
+      expect(llmSpy).not.toHaveBeenCalled();
     });
   });
 });
