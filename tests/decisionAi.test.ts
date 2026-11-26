@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   decisionRouterNode,
+  getGoogleGenAiClient,
   greetingSmallModelNode,
   pgVectorRetrieverNode,
 } from '../src/agent/nodes.js';
@@ -75,11 +76,10 @@ describe('Decision AI & 4-Tier Model Routing', () => {
 
   describe('decisionRouterNode (gemini-decision-1 Decision Model)', () => {
     it('should return greeting intent when decision model returns greeting', async () => {
-      const mockFetch = vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ decisions: { intent: { choice: 'greeting' } } }),
-      });
-      vi.stubGlobal('fetch', mockFetch);
+      const ai = getGoogleGenAiClient();
+      vi.spyOn(ai.decisions, 'create').mockResolvedValue({
+        answers: { intent: { type: 'choice', choice: 'greeting', confidence: 0.99 } },
+      } as any);
 
       const state = {
         messages: [new HumanMessage('Hi there!')],
@@ -90,12 +90,8 @@ describe('Decision AI & 4-Tier Model Routing', () => {
     });
 
     it('should return error message to user if decision model call fails', async () => {
-      const mockFetch = vi.fn().mockResolvedValue({
-        ok: false,
-        status: 500,
-        text: async () => 'Internal Server Error',
-      });
-      vi.stubGlobal('fetch', mockFetch);
+      const ai = getGoogleGenAiClient();
+      vi.spyOn(ai.decisions, 'create').mockRejectedValue(new Error('500 Internal Server Error'));
 
       const state = {
         messages: [new HumanMessage('Book an appointment')],

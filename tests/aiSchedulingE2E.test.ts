@@ -1,27 +1,10 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { agentGraph } from '../src/agent/graph.js';
 import { HumanMessage } from '@langchain/core/messages';
 import * as otpService from '../src/services/otpService.js';
 import * as emailQueue from '../src/queues/emailQueue.js';
 
 describe('End-to-End AI Multi-Turn Scheduling', () => {
-  const originalFetch = globalThis.fetch;
-
-  beforeEach(() => {
-    globalThis.fetch = vi.fn().mockImplementation((url: string | URL | Request, opts?: any) => {
-      if (String(url).includes('createDecision')) {
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({ decisions: { intent: { choice: 'schedule_enquiry' } } }),
-        });
-      }
-      return originalFetch(url, opts);
-    });
-  });
-
-  afterEach(() => {
-    globalThis.fetch = originalFetch;
-  });
   it('should enforce name requirement, extract phone and reason, verify OTP and book', async () => {
     vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValue('fakehash');
     vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValue('job-1' as any);

@@ -5,25 +5,8 @@ import * as otpService from '../src/services/otpService.js';
 import * as emailQueue from '../src/queues/emailQueue.js';
 
 describe('LangGraph Agent Multi-Node Orchestration', () => {
-  const originalFetch = globalThis.fetch;
-
   beforeEach(async () => {
     vi.restoreAllMocks();
-    globalThis.fetch = vi.fn().mockImplementation((url: string | URL | Request, opts?: any) => {
-      const urlStr = String(url);
-      if (urlStr.includes('createDecision')) {
-        const body = typeof opts?.body === 'string' ? JSON.parse(opts.body) : {};
-        const input = (body.input || '').toLowerCase();
-        let choice = 'knowledge_query';
-        if (/^(hi|hello|hey)\b/i.test(input)) choice = 'greeting';
-        else if (/schedule|meeting|consultation|otp|\d{6}|@/i.test(input)) choice = 'schedule_enquiry';
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({ decisions: { intent: { choice } } }),
-        });
-      }
-      return originalFetch(url, opts);
-    });
     await new Promise((resolve) => setTimeout(resolve, 500));
   });
 

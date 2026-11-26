@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { app } from '../src/server.js';
 import { redisClient } from '../src/services/redisClient.js';
 import { Server } from 'http';
@@ -6,20 +6,8 @@ import { Server } from 'http';
 describe('Express REST API Endpoints', () => {
   let server: Server;
   let baseUrl: string;
-  const originalFetch = globalThis.fetch;
 
   beforeAll(async () => {
-    globalThis.fetch = vi.fn().mockImplementation((url: string | URL | Request, opts?: any) => {
-      const urlStr = String(url);
-      if (urlStr.includes('createDecision')) {
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({ decisions: { intent: { choice: 'knowledge_query' } } }),
-        });
-      }
-      return originalFetch(url, opts);
-    });
-
     await new Promise<void>((resolve) => {
       server = app.listen(0, () => {
         const address = server.address() as any;
@@ -30,7 +18,6 @@ describe('Express REST API Endpoints', () => {
   });
 
   afterAll(async () => {
-    globalThis.fetch = originalFetch;
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => {
       server.close(() => resolve());

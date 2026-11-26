@@ -1,5 +1,6 @@
 import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { ChatOpenAI } from '@langchain/openai';
+import { GoogleGenAI } from '@google/genai';
 import { z } from 'zod';
 import { config } from '../config/index.js';
 import { AgentStateType, LeadInfo } from './state.js';
@@ -40,24 +41,33 @@ function createModelInstance(modelName: string, temperature = 0) {
   });
 }
 
-/** 1. Decision AI Model: gemini-decision-1 (Fast intent & query router) */
-export function getDecisionModel(temperature = 0) {
-  return createModelInstance(config.models?.decision || 'gemini-decision-1', temperature);
+let genAiClient: GoogleGenAI | null = null;
+
+/** Singleton Google GenAI SDK client (used for native Decision AI / Gemini APIs) */
+export function getGoogleGenAiClient(): GoogleGenAI {
+  if (!genAiClient) {
+    const apiKey = config.gemini.apiKey || config.llm.apiKey;
+    if (!apiKey || apiKey === 'mock-key') {
+      throw new Error('Gemini API key is not configured.');
+    }
+    genAiClient = new GoogleGenAI({ apiKey, apiVersion: 'v1beta' });
+  }
+  return genAiClient;
 }
 
-/** 2. Greeting Small Model: gemini-flash-lite-latest (Instant greetings with zero DB retrieval) */
+/** 1. Greeting Small Model: gemini-flash-lite-latest (Instant greetings with zero DB retrieval) */
 export function getGreetingSmallModel(temperature = 0.3) {
   return createModelInstance(config.models?.greeting || 'gemini-flash-lite-latest', temperature);
 }
 
-/** 3. Knowledge Big Model: gemini-flash-latest (Deep contextual synthesis) */
+/** 2. Knowledge Big Model: gemini-flash-latest (Deep contextual synthesis) */
 export function getKnowledgeBigModel(temperature = 0.2) {
   return createModelInstance(config.models?.big || 'gemini-flash-latest', temperature);
 }
 
 // Backward compatibility alias
 export const getLlmModel = getKnowledgeBigModel;
-export const getOpenRouterModel = getDecisionModel;
+export const getOpenRouterModel = getGreetingSmallModel;
 
 function parseToolOutput(res: any): any {
   const str =
@@ -85,42 +95,34 @@ function getLastUserMessage(messages: BaseMessage[]): string {
 }
 
 /**
- * Decision Node: Direct call to gemini-decision-1 Decision Model (Zero LLM)
+ * Decision Node: Calls gemini-decision-1 via official @google/genai SDK (Zero LLM)
  * If failed, returns error message to user to try again later.
  */
 async function callDecisionModel(message: string): Promise<'greeting' | 'schedule_enquiry' | 'knowledge_query'> {
-  const apiKey = config.gemini.apiKey || config.llm.apiKey;
+  const ai = getGoogleGenAiClient();
   const modelName = config.models.decision || 'gemini-decision-1';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:createDecision?key=${apiKey}`;
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      input: message,
-      questions: {
-        intent: {
-          type: 'choice',
-          criteria: {
-            greeting: 'Casual greeting or pleasantry',
-            schedule_enquiry:
-              'Scheduling a meeting or consultation, sharing contact details, or entering an OTP code',
-            knowledge_query:
-              'Questions about technical skills, experience, projects, or resume',
-          },
+  const response = await ai.decisions.create({
+    model: modelName,
+    input: message,
+    questions: {
+      intent: {
+        type: 'choice',
+        instructions: 'Classify the user message intent.',
+        criteria: {
+          greeting: 'Casual greeting or pleasantry like hi, hello, hey',
+          schedule_enquiry:
+            'Scheduling or requesting a meeting/consultation, sharing contact details, or entering an OTP code',
+          knowledge_query:
+            'Questions about Vyshnav skills, experience, projects, education, or resume',
         },
       },
-    }),
+    },
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Decision model returned ${response.status}: ${errorText}`);
-  }
-
-  const data: any = await response.json();
-  const choice = data?.decisions?.intent?.choice || data?.intent?.choice;
-  if (!choice) {
+  const intentAnswer = response?.answers?.intent;
+  const choice = intentAnswer?.type === 'choice' ? intentAnswer.choice : undefined;
+  if (choice !== 'greeting' && choice !== 'schedule_enquiry' && choice !== 'knowledge_query') {
     throw new Error('Decision model returned invalid response');
   }
 
