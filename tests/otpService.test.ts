@@ -1,5 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { generateOtp, hashOtp, storeHashedOtp, verifyEnteredOtp, isEmailVerified } from '../src/services/otpService.js';
+import {
+  consumeVerifiedEmail,
+  generateOtp,
+  hashOtp,
+  isEmailVerified,
+  markEmailVerified,
+  storeHashedOtp,
+  verifyEnteredOtp,
+} from '../src/services/otpService.js';
 import { redisClient } from '../src/services/redisClient.js';
 
 describe('OTP Service', () => {
@@ -106,5 +114,20 @@ describe('OTP Service', () => {
 
     const lateValidAttempt = await verifyEnteredOtp(testEmail, otp);
     expect(lateValidAttempt.success).toBe(false);
+  });
+
+  it('clears previously verified status when an OTP attempt fails or is consumed', async () => {
+    await markEmailVerified(testEmail);
+    expect(await isEmailVerified(testEmail)).toBe(true);
+
+    // Failed OTP check (no active OTP / wrong OTP) clears verified_email
+    const failed = await verifyEnteredOtp(testEmail, '123456');
+    expect(failed.success).toBe(false);
+    expect(await isEmailVerified(testEmail)).toBe(false);
+
+    // Explicitly consuming verified status after booking clears it too
+    await markEmailVerified(testEmail);
+    await consumeVerifiedEmail(testEmail);
+    expect(await isEmailVerified(testEmail)).toBe(false);
   });
 });

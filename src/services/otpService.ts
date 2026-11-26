@@ -61,6 +61,7 @@ export async function verifyEnteredOtp(
 
   const storedHash = await redisClient.get(otpKey);
   if (!storedHash) {
+    await redisClient.del(verifiedKey);
     return {
       success: false,
       message: 'No active OTP found or it has expired. Please request a new verification code.',
@@ -72,6 +73,7 @@ export async function verifyEnteredOtp(
   if (attempts > MAX_ATTEMPTS) {
     await redisClient.del(otpKey);
     await redisClient.del(attemptsKey);
+    await redisClient.del(verifiedKey);
     return {
       success: false,
       message: 'Too many incorrect attempts. For security, your OTP was invalidated. Please request a new code.',
@@ -89,6 +91,7 @@ export async function verifyEnteredOtp(
     crypto.timingSafeEqual(storedBuf, enteredBuf);
 
   if (!isMatch) {
+    await redisClient.del(verifiedKey);
     const remaining = MAX_ATTEMPTS - attempts;
     if (remaining <= 0) {
       await redisClient.del(otpKey);
@@ -119,9 +122,13 @@ export async function verifyEnteredOtp(
  * Checks if an active (unexpired) OTP currently exists for this email.
  */
 export async function hasActiveOtp(email: string): Promise<boolean> {
-  const normalizedEmail = email.toLowerCase().trim();
-  const val = await redisClient.get(`otp:${normalizedEmail}`);
-  return Boolean(val);
+  try {
+    const normalizedEmail = email.toLowerCase().trim();
+    const val = await redisClient.get(`otp:${normalizedEmail}`);
+    return Boolean(val);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -131,6 +138,14 @@ export async function isEmailVerified(email: string): Promise<boolean> {
   const normalizedEmail = email.toLowerCase().trim();
   const val = await redisClient.get(`verified_email:${normalizedEmail}`);
   return val === 'true';
+}
+
+/**
+ * Clears verified status once a booking completes so OTP verification stays single-use.
+ */
+export async function consumeVerifiedEmail(email: string): Promise<void> {
+  const normalizedEmail = email.toLowerCase().trim();
+  await redisClient.del(`verified_email:${normalizedEmail}`);
 }
 
 /**

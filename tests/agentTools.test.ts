@@ -81,8 +81,24 @@ describe('Agent Tools', () => {
       expect(parsed.message).toContain('has not been verified yet');
     });
 
-    it('should schedule enquiry and promise 24-hour response when email is verified', async () => {
+    it('should reject scheduling when phone or reason is missing', async () => {
+      const verifiedSpy = vi.spyOn(otpService, 'isEmailVerified').mockResolvedValue(true);
+
+      const res = await scheduleEnquiryTool.invoke({
+        name: 'John Doe',
+        email: 'john@example.com',
+        phone: ' ',
+        reason: 'Discuss AI project',
+      });
+
+      const parsed = JSON.parse(res);
+      expect(parsed.status).toBe('missing_fields');
+      expect(verifiedSpy).not.toHaveBeenCalled();
+    });
+
+    it('should schedule enquiry, promise 24-hour response, and consume verified email once', async () => {
       vi.spyOn(otpService, 'isEmailVerified').mockResolvedValue(true);
+      const consumeSpy = vi.spyOn(otpService, 'consumeVerifiedEmail').mockResolvedValue();
       vi.spyOn(redisClient, 'set').mockResolvedValue('OK' as any);
       vi.spyOn(redisClient, 'lpush').mockResolvedValue(1 as any);
       const ltrimSpy = vi.spyOn(redisClient, 'ltrim').mockResolvedValue('OK' as any);
@@ -100,6 +116,7 @@ describe('Agent Tools', () => {
       expect(parsed.enquiryId).toBeDefined();
       expect(parsed.message).toContain('within 24 hours');
       expect(ltrimSpy).toHaveBeenCalledWith('enquiries:list', 0, 999);
+      expect(consumeSpy).toHaveBeenCalledWith('john@example.com');
       expect(queueSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           name: 'John Doe',

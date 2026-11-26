@@ -7,6 +7,7 @@ import {
   pgVectorRetrieverNode,
   scheduleEnquiryNode,
 } from '../src/agent/nodes.js';
+import { extractOtpFromLastMessage } from '../src/agent/nodes/scheduleEnquiryNode.js';
 import { agentGraph } from '../src/agent/graph.js';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import * as pgVectorService from '../src/services/pgVectorService.js';
@@ -208,15 +209,15 @@ describe('Decision AI & 4-Tier Model Routing', () => {
         invoke: vi.fn().mockResolvedValue({
           name: 'Alice',
           email: 'bob@example.com',
-          phone: null,
-          reason: null,
+          phone: '+1 555-0100',
+          reason: 'Consultation',
           otp: null,
           action: 'send_otp',
         }),
       } as any);
 
       const dispatchRes = await scheduleEnquiryNode({
-        messages: [new HumanMessage('Use bob@example.com instead')],
+        messages: [new HumanMessage('Use bob@example.com instead, phone +1 555-0100 for consultation')],
         leadInfo: { name: 'Alice', email: 'alice@example.com' },
         isVerified: true,
       } as any);
@@ -231,8 +232,8 @@ describe('Decision AI & 4-Tier Model Routing', () => {
         invoke: vi.fn().mockResolvedValue({
           name: 'Alice',
           email: 'bob@example.com',
-          phone: null,
-          reason: null,
+          phone: '+1 555-0100',
+          reason: 'Consultation',
           otp: '456789',
           action: 'schedule',
         }),
@@ -240,11 +241,77 @@ describe('Decision AI & 4-Tier Model Routing', () => {
 
       await scheduleEnquiryNode({
         messages: [new HumanMessage('456789')],
-        leadInfo: { name: 'Alice', email: 'bob@example.com' },
+        leadInfo: { name: 'Alice', email: 'bob@example.com', phone: '+1 555-0100', reason: 'Consultation' },
         isVerified: Boolean(dispatchRes.isVerified),
       } as any);
 
       expect(verifySpy).toHaveBeenCalledWith('bob@example.com', '456789');
+    });
+
+    it('requires phone and reason before dispatching an OTP or scheduling', async () => {
+      const otpSpy = vi.spyOn(otpService, 'storeHashedOtp');
+      const leadSpy = vi.spyOn(emailQueue, 'enqueueLeadNotification');
+
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alice',
+          email: 'alice@example.com',
+          phone: null,
+          reason: null,
+          otp: null,
+          action: 'schedule',
+        }),
+      } as any);
+
+      const res = await scheduleEnquiryNode({
+        messages: [new HumanMessage('My name is Alice and email is alice@example.com')],
+        leadInfo: {},
+        isVerified: false,
+      } as any);
+
+      const reply = String(res.messages![0].content).toLowerCase();
+      expect(reply).toContain('phone number');
+      expect(reply).toContain('reason for connecting');
+      expect(otpSpy).not.toHaveBeenCalled();
+      expect(leadSpy).not.toHaveBeenCalled();
+    });
+
+    it('extracts OTP deterministically from latest message even if AI omits it and ignores stale history OTPs', async () => {
+      expect(extractOtpFromLastMessage('654321', false)).toBe('654321');
+      expect(extractOtpFromLastMessage('Here is my otp: 654321', false)).toBe('654321');
+      expect(extractOtpFromLastMessage('+91 9876543210', true)).toBeNull();
+
+      const verifySpy = vi.spyOn(otpService, 'verifyEnteredOtp').mockResolvedValueOnce({
+        success: false,
+        message: 'Invalid code.',
+      });
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alice',
+          email: 'alice@example.com',
+          phone: '+1 555-0100',
+          reason: 'Project chat',
+          otp: null, // Simulate LLM failing to extract bare OTP
+          action: 'schedule',
+        }),
+      } as any);
+
+      const res = await scheduleEnquiryNode({
+        messages: [
+          new AIMessage('A 6-digit verification code has been dispatched to alice@example.com.'),
+          new HumanMessage('654321'),
+        ],
+        leadInfo: {
+          name: 'Alice',
+          email: 'alice@example.com',
+          phone: '+1 555-0100',
+          reason: 'Project chat',
+        },
+        isVerified: false,
+      } as any);
+
+      expect(verifySpy).toHaveBeenCalledWith('alice@example.com', '654321');
+      expect(res.isVerified).toBe(false);
     });
   });
 });

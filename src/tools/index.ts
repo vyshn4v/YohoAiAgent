@@ -2,10 +2,11 @@ import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import {
+  consumeVerifiedEmail,
   generateOtp,
+  isEmailVerified,
   storeHashedOtp,
   verifyEnteredOtp,
-  isEmailVerified,
 } from '../services/otpService.js';
 import { enqueueOtpEmail, enqueueLeadNotification } from '../queues/emailQueue.js';
 import { redisClient } from '../services/redisClient.js';
@@ -119,6 +120,14 @@ export const scheduleEnquiryTool = tool(
     log.start({ hasName: Boolean(name), hasPhone: Boolean(phone), reasonLen: reason.length });
 
     try {
+      if (!name?.trim() || !email?.trim() || !phone?.trim() || !reason?.trim()) {
+        log.warn('Blocked enquiry scheduling due to missing required details');
+        return JSON.stringify({
+          status: 'missing_fields',
+          message: 'All details (name, email, phone, and reason) are required to schedule an enquiry.',
+        });
+      }
+
       const verified = await isEmailVerified(email);
       if (!verified) {
         log.done({ status: 'unverified' });
@@ -132,10 +141,10 @@ export const scheduleEnquiryTool = tool(
       const enquiryId = uuidv4();
       const enquiryData = {
         id: enquiryId,
-        name,
-        email,
-        phone,
-        reason,
+        name: name.trim(),
+        email: email.trim(),
+        phone: phone.trim(),
+        reason: reason.trim(),
         createdAt: new Date().toISOString(),
         status: 'confirmed',
       };
@@ -152,7 +161,15 @@ export const scheduleEnquiryTool = tool(
       await redisClient.ltrim('enquiries:list', 0, 999);
 
       // Enqueue notification email to host via BullMQ
-      await enqueueLeadNotification({ name, email, phone, reason });
+      await enqueueLeadNotification({
+        name: enquiryData.name,
+        email: enquiryData.email,
+        phone: enquiryData.phone,
+        reason: enquiryData.reason,
+      });
+
+      // Single-use verification: consume verified flag so future enquiries require a fresh OTP
+      await consumeVerifiedEmail(email);
 
       log.done({ status: 'confirmed', enquiryId });
       return JSON.stringify({

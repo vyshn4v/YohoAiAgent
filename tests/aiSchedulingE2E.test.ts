@@ -3,10 +3,13 @@ import { agentGraph } from '../src/agent/graph.js';
 import { HumanMessage } from '@langchain/core/messages';
 import * as otpService from '../src/services/otpService.js';
 import * as emailQueue from '../src/queues/emailQueue.js';
+import { redisClient } from '../src/services/redisClient.js';
 
 describe('End-to-End AI Multi-Turn Scheduling', () => {
   it('should enforce name requirement, extract phone and reason, verify OTP and book', async () => {
     vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValue('fakehash');
+    vi.spyOn(otpService, 'hasActiveOtp').mockResolvedValue(false);
+    vi.spyOn(otpService, 'consumeVerifiedEmail').mockResolvedValue();
     vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValue('job-1' as any);
     vi.spyOn(otpService, 'verifyEnteredOtp').mockResolvedValue({
       success: true,
@@ -14,6 +17,9 @@ describe('End-to-End AI Multi-Turn Scheduling', () => {
     });
     vi.spyOn(otpService, 'isEmailVerified').mockResolvedValueOnce(false).mockResolvedValue(true);
     vi.spyOn(emailQueue, 'enqueueLeadNotification').mockResolvedValue('job-2' as any);
+    vi.spyOn(redisClient, 'set').mockResolvedValue('OK' as any);
+    vi.spyOn(redisClient, 'lpush').mockResolvedValue(1 as any);
+    vi.spyOn(redisClient, 'ltrim').mockResolvedValue('OK' as any);
 
     // Turn 1: Providing email only without name
     console.log('--- Turn 1: Email only ---');
