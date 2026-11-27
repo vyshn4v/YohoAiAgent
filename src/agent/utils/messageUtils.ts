@@ -14,7 +14,11 @@ export function parseToolOutput(res: unknown): Record<string, any> {
       : JSON.stringify(res);
 
   try {
-    return JSON.parse(str);
+    const parsed = JSON.parse(str);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('Tool output JSON must be a plain object.');
+    }
+    return parsed;
   } catch {
     return { status: 'error', message: str };
   }

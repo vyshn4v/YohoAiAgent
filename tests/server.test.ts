@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest
 import { AIMessage } from '@langchain/core/messages';
 import { app } from '../src/server.js';
 import { agentGraph, GRAPH_RUN_NAME } from '../src/agent/graph.js';
+import * as ingestModule from '../src/scripts/ingestResumePdf.js';
 import { redisClient } from '../src/services/redisClient.js';
 import * as sessionStore from '../src/http/sessionStore.js';
 import { Server } from 'http';
@@ -84,6 +85,68 @@ describe('Express REST API Endpoints', () => {
     expect(res.status).toBe(400);
     const data = await res.json();
     expect(data.error).toBe('Message string is required.');
+  });
+
+  it('validates conversationId across POST/GET chat routes before session lookup or SSE headers', async () => {
+    const sessionGetSpy = vi.spyOn(sessionStore, 'getConversationSession');
+    const lockSpy = vi.spyOn(sessionStore, 'withConversationLock');
+
+    for (const badId of ['', '   ', 123, null, ['a', 'b']]) {
+      const postRes = await fetch(`${baseUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'hi', conversationId: badId }),
+      });
+      expect(postRes.status).toBe(400);
+      expect(postRes.headers.get('content-type')).toContain('application/json');
+
+      const streamPostRes = await fetch(`${baseUrl}/api/chat/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'hi', conversationId: badId }),
+      });
+      expect(streamPostRes.status).toBe(400);
+      expect(streamPostRes.headers.get('content-type')).not.toContain('text/event-stream');
+    }
+
+    const emptyQueryStream = await fetch(`${baseUrl}/api/chat/stream?message=hi&conversationId=`);
+    expect(emptyQueryStream.status).toBe(400);
+    expect(emptyQueryStream.headers.get('content-type')).not.toContain('text/event-stream');
+
+    const whitespaceQueryStream = await fetch(
+      `${baseUrl}/api/chat/stream?message=hi&conversationId=%20%20`
+    );
+    expect(whitespaceQueryStream.status).toBe(400);
+
+    expect(sessionGetSpy).not.toHaveBeenCalled();
+    expect(lockSpy).not.toHaveBeenCalled();
+
+    // Trims valid non-empty conversationId consistently across lock and session retrieval
+    sessionGetSpy.mockResolvedValueOnce({
+      messages: [],
+      leadInfo: {},
+      isVerified: false,
+      updatedAt: Date.now(),
+    });
+    vi.spyOn(sessionStore, 'saveConversationSession').mockResolvedValueOnce();
+    vi.spyOn(agentGraph, 'invoke').mockResolvedValueOnce({
+      intent: 'greeting',
+      messages: [new AIMessage('Hi there!')],
+      leadInfo: {},
+      isVerified: false,
+      uiAction: null,
+    } as any);
+
+    const trimmedRes = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hi', conversationId: '  trimmed-conv-1  ' }),
+    });
+    expect(trimmedRes.status).toBe(200);
+    const trimmedBody = await trimmedRes.json();
+    expect(trimmedBody.conversationId).toBe('trimmed-conv-1');
+    expect(lockSpy).toHaveBeenCalledWith('trimmed-conv-1', expect.any(Function));
+    expect(sessionGetSpy).toHaveBeenCalledWith('trimmed-conv-1');
   });
 
   it('POST /api/chat/stream should stream SSE tokens and non-empty done reply with CORS headers', async () => {
@@ -177,6 +240,7 @@ describe('Express REST API Endpoints', () => {
     });
     expect(wrongKeyRes.status).toBe(401);
 
+    vi.spyOn(redisClient, 'llen').mockResolvedValueOnce(2);
     vi.spyOn(redisClient, 'lrange').mockResolvedValueOnce(['id-1', 'id-2']);
     const mgetSpy = vi
       .spyOn(redisClient, 'mget')
@@ -192,7 +256,86 @@ describe('Express REST API Endpoints', () => {
     const body = await okRes.json();
     expect(mgetSpy).toHaveBeenCalledWith(['enquiry:id-1', 'enquiry:id-2']);
     expect(body.count).toBe(1);
+    expect(body.page).toBe(1);
+    expect(body.limit).toBe(50);
+    expect(body.hasMore).toBe(false);
     expect(body.enquiries[0].name).toBe('Alice');
+  });
+
+  it('permits X-API-Key on CORS preflight and supports paginated /api/enquiries and /api/ingest non-2xx errors', async () => {
+    process.env.ADMIN_API_KEY = 'super-secret-admin-key';
+
+    const preflightRes = await fetch(`${baseUrl}/api/enquiries`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://portfolio-frontend.example.com',
+        'Access-Control-Request-Method': 'GET',
+        'Access-Control-Request-Headers': 'X-API-Key, Content-Type',
+      },
+    });
+    expect(preflightRes.status).toBe(204);
+    expect(preflightRes.headers.get('access-control-allow-origin')).toBe(
+      'https://portfolio-frontend.example.com'
+    );
+    expect(preflightRes.headers.get('access-control-allow-headers')?.toLowerCase()).toContain(
+      'x-api-key'
+    );
+
+    vi.spyOn(redisClient, 'llen').mockResolvedValueOnce(5);
+    const lrangeSpy = vi.spyOn(redisClient, 'lrange').mockResolvedValueOnce(['id-3', 'id-4']);
+    vi.spyOn(redisClient, 'mget').mockResolvedValueOnce([
+      JSON.stringify({ id: 'id-3', name: 'Carol' }),
+      JSON.stringify({ id: 'id-4', name: 'Dave' }),
+    ]);
+
+    const pageRes = await fetch(`${baseUrl}/api/enquiries?page=2&limit=2`, {
+      headers: { 'x-api-key': 'super-secret-admin-key' },
+    });
+    expect(pageRes.status).toBe(200);
+    const pageBody = await pageRes.json();
+    expect(lrangeSpy).toHaveBeenCalledWith('enquiries:list', 2, 3);
+    expect(pageBody).toMatchObject({
+      count: 2,
+      page: 2,
+      limit: 2,
+      total: 5,
+      totalPages: 3,
+      hasMore: true,
+      nextPage: 3,
+    });
+
+    const badLimitRes = await fetch(`${baseUrl}/api/enquiries?page=1&limit=101`, {
+      headers: { 'x-api-key': 'super-secret-admin-key' },
+    });
+    expect(badLimitRes.status).toBe(400);
+
+    vi.spyOn(ingestModule, 'ingestResumePdf').mockResolvedValueOnce({
+      success: false,
+      count: 0,
+      message: 'No resume PDF found.',
+    });
+    const failedIngestRes = await fetch(`${baseUrl}/api/ingest`, {
+      method: 'POST',
+      headers: { 'x-api-key': 'super-secret-admin-key' },
+    });
+    expect(failedIngestRes.status).toBe(500);
+    const failedIngestBody = await failedIngestRes.json();
+    expect(failedIngestBody.success).toBe(false);
+    expect(failedIngestBody.error).toContain('No resume PDF found');
+
+    vi.spyOn(ingestModule, 'ingestResumePdf').mockResolvedValueOnce({
+      success: true,
+      count: 4,
+      message: 'Replaced 4 chunks.',
+    });
+    const okIngestRes = await fetch(`${baseUrl}/api/ingest`, {
+      method: 'POST',
+      headers: { 'x-api-key': 'super-secret-admin-key' },
+    });
+    expect(okIngestRes.status).toBe(200);
+    const okIngestBody = await okIngestRes.json();
+    expect(okIngestBody.success).toBe(true);
+    expect(okIngestBody.count).toBe(4);
   });
 
   it('POST /api/chat/stream emits status, tokens, ui_action, done, and saves completed session', async () => {
@@ -245,7 +388,16 @@ describe('Express REST API Endpoints', () => {
   });
 
   it('POST /api/chat/stream does not persist empty turn if client disconnects mid-stream', async () => {
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let resolveCancelObserved!: () => void;
+    const cancelObserved = new Promise<void>((resolve) => {
+      resolveCancelObserved = resolve;
+    });
+    vi.spyOn(console, 'warn').mockImplementation((...args: any[]) => {
+      if (args.join(' ').includes('Client disconnected mid-stream')) {
+        resolveCancelObserved();
+      }
+    });
+
     vi.spyOn(sessionStore, 'getConversationSession').mockResolvedValueOnce({
       messages: [],
       leadInfo: {},
@@ -254,9 +406,25 @@ describe('Express REST API Endpoints', () => {
     });
     const saveSpy = vi.spyOn(sessionStore, 'saveConversationSession').mockResolvedValue();
 
+    let resolveHandlerPromise!: (p: Promise<unknown>) => void;
+    const handlerPromiseReady = new Promise<Promise<unknown>>((resolve) => {
+      resolveHandlerPromise = resolve;
+    });
+    const origWithLock = sessionStore.withConversationLock;
+    vi.spyOn(sessionStore, 'withConversationLock').mockImplementationOnce((id, fn, opts) => {
+      const p = origWithLock(id, fn, opts);
+      resolveHandlerPromise(p);
+      return p;
+    });
+
+    let releaseFinalGraphEvent!: () => void;
+    const finalGraphEventGate = new Promise<void>((resolve) => {
+      releaseFinalGraphEvent = resolve;
+    });
+
     vi.spyOn(agentGraph, 'streamEvents').mockImplementationOnce(async function* () {
       yield { event: 'on_chain_start', metadata: { langgraph_node: 'decision_router' } } as any;
-      await new Promise((r) => setTimeout(r, 150));
+      await finalGraphEventGate;
       yield {
         event: 'on_chain_end',
         name: GRAPH_RUN_NAME,
@@ -272,7 +440,12 @@ describe('Express REST API Endpoints', () => {
     const reader = res.body!.getReader();
     await reader.read();
     await reader.cancel();
-    await new Promise((r) => setTimeout(r, 200));
+
+    // Wait explicitly until server observes client cancellation before releasing the graph event
+    await cancelObserved;
+    releaseFinalGraphEvent();
+    const handlerPromise = await handlerPromiseReady;
+    await handlerPromise;
 
     expect(saveSpy).not.toHaveBeenCalled();
   });

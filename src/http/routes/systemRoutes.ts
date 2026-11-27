@@ -40,6 +40,29 @@ function requireAdminAuth(req: Request, res: Response, next: NextFunction): void
   next();
 }
 
+const DEFAULT_ENQUIRIES_LIMIT = 50;
+const MAX_ENQUIRIES_LIMIT = 100;
+
+function parsePositiveIntParam(
+  raw: unknown,
+  defaultValue: number,
+  name: string,
+  max?: number
+): { valid: true; value: number } | { valid: false; error: string } {
+  if (raw === undefined) {
+    return { valid: true, value: defaultValue };
+  }
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) {
+    return { valid: false, error: `Query parameter "${name}" must be a positive integer.` };
+  }
+  const num = Number(raw.trim());
+  if (!Number.isSafeInteger(num) || num < 1 || (max !== undefined && num > max)) {
+    const bound = max !== undefined ? ` between 1 and ${max}` : ' >= 1';
+    return { valid: false, error: `Query parameter "${name}" must be an integer${bound}.` };
+  }
+  return { valid: true, value: num };
+}
+
 export function createSystemRouter(): Router {
   const router = Router();
 
@@ -91,15 +114,44 @@ export function createSystemRouter(): Router {
   router.post('/api/ingest', requireAdminAuth, async (_req: Request, res: Response) => {
     try {
       const result = await ingestResumePdf();
+      if (!result.success) {
+        res.status(500).json({ error: result.message, ...result });
+        return;
+      }
       res.json(result);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   });
 
-  router.get('/api/enquiries', requireAdminAuth, async (_req: Request, res: Response) => {
+  router.get('/api/enquiries', requireAdminAuth, async (req: Request, res: Response) => {
+    const pageResult = parsePositiveIntParam(req.query.page, 1, 'page');
+    if (!pageResult.valid) {
+      res.status(400).json({ error: pageResult.error });
+      return;
+    }
+
+    const limitResult = parsePositiveIntParam(
+      req.query.limit,
+      DEFAULT_ENQUIRIES_LIMIT,
+      'limit',
+      MAX_ENQUIRIES_LIMIT
+    );
+    if (!limitResult.valid) {
+      res.status(400).json({ error: limitResult.error });
+      return;
+    }
+
+    const page = pageResult.value;
+    const limit = limitResult.value;
+    const start = (page - 1) * limit;
+    const stop = start + limit - 1;
+
     try {
-      const ids = await redisClient.lrange('enquiries:list', 0, 50);
+      const [total, ids] = await Promise.all([
+        redisClient.llen('enquiries:list'),
+        redisClient.lrange('enquiries:list', start, stop),
+      ]);
       const enquiries: Record<string, any>[] = [];
       if (ids.length > 0) {
         const values = await redisClient.mget(ids.map((id) => `enquiry:${id}`));
@@ -109,7 +161,19 @@ export function createSystemRouter(): Router {
           }
         }
       }
-      res.json({ count: enquiries.length, enquiries });
+      const totalPages = Math.max(1, Math.ceil(total / limit));
+      const hasMore = start + ids.length < total;
+      const nextPage = hasMore ? page + 1 : null;
+      res.json({
+        count: enquiries.length,
+        page,
+        limit,
+        total,
+        totalPages,
+        hasMore,
+        nextPage,
+        enquiries,
+      });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

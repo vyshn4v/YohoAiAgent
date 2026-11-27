@@ -9,6 +9,9 @@ import {
 import { AgentStateType } from '../state.js';
 import { getLastUserMessage } from '../utils/messageUtils.js';
 
+const INSUFFICIENT_CONTEXT_REPLY =
+  "I don't have enough verified information in Vyshnav P C's knowledge base to answer that reliably. Would you like to schedule a call with him? Please share your name, email address, phone number, and reason for connecting.";
+
 /**
  * Node 4: Knowledge Node (Big Model: gemini-3.5-flash-lite)
  * Synthesizes grounded answers as Yoho using the retrieved pgvector context.
@@ -19,15 +22,24 @@ export async function bigModelKnowledgeNode(
 ): Promise<Partial<AgentStateType>> {
   const lastMessage = getLastUserMessage(state.messages);
   const modelName = config.models?.big || 'gemini-3.5-flash-lite';
-  const docsCount = state.retrievedDocs?.length || 0;
+  const retrievedDocs = state.retrievedDocs || [];
+  const docsCount = retrievedDocs.length;
   const log = createNodeLogger('KnowledgeNode', runConfig);
   log.start({ model: modelName, docs: docsCount, messageLen: lastMessage.length });
 
-  const contextText =
-    (state.retrievedDocs || [])
-      .map((d, i) => `[Source ${i + 1}]:\n${d.text}`)
-      .join('\n\n') ||
-    'Vyshnav P C is a Full-Stack & AI Engineer specialized in LangGraph, TypeScript, Python, and Node.js.';
+  if (docsCount === 0) {
+    log.warn('No retrievedDocs provided; returning insufficient-context reply');
+    log.done({ replyLen: INSUFFICIENT_CONTEXT_REPLY.length, docs: 0, fallback: 'insufficient_context' });
+    return {
+      finalMessage: INSUFFICIENT_CONTEXT_REPLY,
+      messages: [new AIMessage(INSUFFICIENT_CONTEXT_REPLY)],
+      uiAction: null,
+    };
+  }
+
+  const contextText = retrievedDocs
+    .map((d, i) => `[Source ${i + 1}]:\n${d.text}`)
+    .join('\n\n');
 
   const knowledgeSystemPrompt = `You are Yoho, AI assistant for Vyshnav P C (Full-Stack & AI Engineer).
 Answer concisely and professionally using ONLY the context below. Highlight concrete skills and results. If missing, state what is known and offer a call.

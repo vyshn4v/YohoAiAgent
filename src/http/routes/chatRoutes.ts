@@ -11,39 +11,69 @@ import {
 } from '../sessionStore.js';
 import { handleSseChatStream } from '../sseChatHandler.js';
 
+function validateConversationId(
+  raw: unknown
+): { valid: true; value: string } | { valid: false; error: string } {
+  if (raw === undefined) {
+    return { valid: true, value: uuidv4() };
+  }
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return { valid: false, error: 'conversationId must be a non-empty string.' };
+  }
+  return { valid: true, value: raw.trim() };
+}
+
 export function createChatRouter(): Router {
   const router = Router();
 
   router.post('/api/chat/stream', async (req: Request, res: Response): Promise<void> => {
-    const { message, conversationId = uuidv4() } = req.body;
+    const { message } = req.body ?? {};
     if (!message || typeof message !== 'string') {
       res.status(400).json({ error: 'Message string is required.' });
       return;
     }
-    await handleSseChatStream(req, res, message, conversationId);
+
+    const convResult = validateConversationId(req.body?.conversationId);
+    if (!convResult.valid) {
+      res.status(400).json({ error: convResult.error });
+      return;
+    }
+
+    await handleSseChatStream(req, res, message, convResult.value);
   });
 
   router.get('/api/chat/stream', async (req: Request, res: Response): Promise<void> => {
     const message = req.query.message as string;
-    const conversationId = (req.query.conversationId as string) || uuidv4();
-
     if (!message || typeof message !== 'string') {
       res.status(400).json({ error: 'Query parameter "message" is required.' });
       return;
     }
 
-    await handleSseChatStream(req, res, message, conversationId);
+    const convResult = validateConversationId(req.query.conversationId);
+    if (!convResult.valid) {
+      res.status(400).json({ error: convResult.error });
+      return;
+    }
+
+    await handleSseChatStream(req, res, message, convResult.value);
   });
 
   router.post('/api/chat', async (req: Request, res: Response): Promise<void> => {
     let log: ReturnType<typeof createNodeLogger> | undefined;
     try {
-      const { message, conversationId = uuidv4() } = req.body;
+      const { message } = req.body ?? {};
 
       if (!message || typeof message !== 'string') {
         res.status(400).json({ error: 'Message string is required.' });
         return;
       }
+
+      const convResult = validateConversationId(req.body?.conversationId);
+      if (!convResult.valid) {
+        res.status(400).json({ error: convResult.error });
+        return;
+      }
+      const conversationId = convResult.value;
 
       if (req.headers.accept?.includes('text/event-stream')) {
         await handleSseChatStream(req, res, message, conversationId);

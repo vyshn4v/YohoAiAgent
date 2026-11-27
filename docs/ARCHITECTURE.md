@@ -139,7 +139,12 @@ sequenceDiagram
 
     User->>Server: Submits { name: "Alex", email: "alex@example.com" }
     Server->>Agent: Run decision_router -> scheduleEnquiryNode
-    Agent->>Tools: Invoke send_verification_otp({ email: "alex@example.com" })
+    Agent-->>Server: Prompts for missing phone number & reason
+    Server-->>User: Request phone number & reason
+
+    User->>Server: Submits { phone: "+1 555-0100", reason: "Architecture review" }
+    Server->>Agent: Run decision_router -> scheduleEnquiryNode
+    Agent->>Tools: Invoke send_verification_otp({ email: "alex@example.com", name: "Alex" })
     Tools-->>Agent: Returns uiAction: { type: 'otp_input', email: "alex@example.com", length: 6 }
     Agent-->>Server: Final State with uiAction & AI message
     Server-->>User: SSE event: ui_action (otp_input)

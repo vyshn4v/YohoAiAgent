@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ChatOpenAI } from '@langchain/openai';
 import {
+  bigModelKnowledgeNode,
   decisionRouterNode,
   getGoogleGenAiClient,
   greetingSmallModelNode,
@@ -92,6 +93,35 @@ describe('Decision AI & 4-Tier Model Routing', () => {
       const result = await pgVectorRetrieverNode(state as any);
 
       expect(result.retrievedDocs).toEqual([]);
+    });
+
+    it('returns an insufficient-context reply offering a call without hardcoded bio or LLM invocation when retrievedDocs is empty', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const llmSpy = vi.spyOn(ChatOpenAI.prototype, 'invoke');
+
+      const result = await bigModelKnowledgeNode({
+        messages: [new HumanMessage('Where did you study?')],
+        retrievedDocs: [],
+      } as any);
+
+      expect(llmSpy).not.toHaveBeenCalled();
+      expect(result.finalMessage).toContain("don't have enough verified information");
+      expect(result.finalMessage).toContain('schedule a call');
+      expect(result.uiAction).toBeNull();
+    });
+
+    it('preserves answers grounded in retrievedDocs when chunks are available', async () => {
+      const llmSpy = vi
+        .spyOn(ChatOpenAI.prototype, 'invoke')
+        .mockResolvedValueOnce(new AIMessage('Grounded in chunk content.') as any);
+
+      const result = await bigModelKnowledgeNode({
+        messages: [new HumanMessage('What frameworks do you use?')],
+        retrievedDocs: [{ id: '1', score: 0.9, text: '### Skills\nLangGraph & TypeScript', metadata: {} }],
+      } as any);
+
+      expect(llmSpy).toHaveBeenCalledTimes(1);
+      expect(result.finalMessage).toBe('Grounded in chunk content.');
     });
   });
 
@@ -202,7 +232,9 @@ describe('Decision AI & 4-Tier Model Routing', () => {
 
     it('resets isVerified on email change and verifies subsequent OTP regardless of action label', async () => {
       vi.spyOn(otpService, 'isEmailVerified').mockResolvedValueOnce(false);
+      vi.spyOn(otpService, 'hasDispatchedOtp').mockResolvedValueOnce(false);
       vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValueOnce('hashed');
+      vi.spyOn(otpService, 'markOtpDispatched').mockResolvedValueOnce();
       vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValueOnce('job-bob' as any);
 
       vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
@@ -312,6 +344,53 @@ describe('Decision AI & 4-Tier Model Routing', () => {
 
       expect(verifySpy).toHaveBeenCalledWith('alice@example.com', '654321');
       expect(res.isVerified).toBe(false);
+    });
+
+    it('retries OTP dispatch when an active hash was not dispatched, but reuses after successful dispatch', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(otpService, 'isEmailVerified').mockResolvedValue(false);
+
+      const activeMock = vi.spyOn(otpService, 'hasActiveOtp').mockResolvedValue(true);
+      const dispatchedMock = vi
+        .spyOn(otpService, 'hasDispatchedOtp')
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(true);
+      vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValueOnce('hashed-retry');
+      const enqueueSpy = vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValueOnce('job-retry' as any);
+      const markDispatchedSpy = vi.spyOn(otpService, 'markOtpDispatched').mockResolvedValueOnce();
+
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValue({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alice',
+          email: 'alice@example.com',
+          phone: '+1 555-0100',
+          reason: 'Consultation',
+          otp: null,
+          action: 'schedule',
+        }),
+      } as any);
+
+      const baseState = {
+        messages: [new HumanMessage('Proceed with scheduling')],
+        leadInfo: {
+          name: 'Alice',
+          email: 'alice@example.com',
+          phone: '+1 555-0100',
+          reason: 'Consultation',
+        },
+        isVerified: false,
+      } as any;
+
+      const retryRes = await scheduleEnquiryNode(baseState);
+      expect(enqueueSpy).toHaveBeenCalledTimes(1);
+      expect(markDispatchedSpy).toHaveBeenCalledWith('alice@example.com', 'hashed-retry');
+      expect(String(retryRes.messages![0].content)).toContain('dispatched to alice@example.com');
+
+      const reuseRes = await scheduleEnquiryNode(baseState);
+      expect(dispatchedMock).toHaveBeenCalledTimes(2);
+      expect(enqueueSpy).toHaveBeenCalledTimes(1);
+      expect(String(reuseRes.messages![0].content)).toContain('already sent');
+      expect(activeMock).not.toHaveBeenCalled();
     });
   });
 });

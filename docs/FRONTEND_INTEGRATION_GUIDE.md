@@ -60,7 +60,7 @@ data: {"node":"knowledge_big_model","status":"generating_answer"}
 ---
 
 ### Event 2: Token Chunks (`event: token`)
-Delivers words/characters in real time as Google Gemini / LLM produces them.
+Delivers chunks of the completed reply **after** the LangGraph execution finishes (not while Gemini / the LLM is generating). Use `event: status` updates above to show real-time progress during generation.
 
 ```text
 event: token

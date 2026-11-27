@@ -2,7 +2,7 @@ import { AIMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import { z } from 'zod';
 import { config } from '../../config/index.js';
-import { hasActiveOtp } from '../../services/otpService.js';
+import { hasDispatchedOtp } from '../../services/otpService.js';
 import {
   scheduleEnquiryTool,
   sendVerificationOtpTool,
@@ -194,7 +194,7 @@ async function handleBookingOrOtpDispatchFlow(params: {
 
   if (scheduleParsed.status === 'unverified') {
     const resendRequested = /\b(resend|new\s+(?:otp|code)|send\s+again)\b/i.test(lastMessage);
-    if (!resendRequested && (await hasActiveOtp(leadInfo.email))) {
+    if (!resendRequested && (await hasDispatchedOtp(leadInfo.email))) {
       log.done({ outcome: 'otp_already_active' });
       return buildScheduleReply(
         `A 6-digit verification code was already sent to ${leadInfo.email}. Please enter that code here to confirm your booking.`,

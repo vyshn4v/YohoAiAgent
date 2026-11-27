@@ -48,15 +48,16 @@ export async function handleSseChatStream(
   }, 15000);
   heartbeat.unref();
 
+  const log = createNodeLogger('Server:SSE', conversationId);
+  let activeNode = 'graph_init';
+
   res.on('close', () => {
-    if (!res.writableEnded) {
+    if (!res.writableEnded && !isClientDisconnected) {
       isClientDisconnected = true;
+      log.warn('Client disconnected mid-stream', { activeNode });
     }
     clearInterval(heartbeat);
   });
-
-  const log = createNodeLogger('Server:SSE', conversationId);
-  let activeNode = 'graph_init';
 
   try {
     sendEvent('status', { status: 'starting', conversationId });
@@ -92,7 +93,6 @@ export async function handleSseChatStream(
 
       for await (const event of stream) {
         if (isClientDisconnected) {
-          log.warn('Client disconnected mid-stream', { activeNode });
           break;
         }
 

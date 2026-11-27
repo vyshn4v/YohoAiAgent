@@ -164,6 +164,18 @@ describe('Node Logging & Failure Diagnostics', () => {
       expect.stringContaining('source=empty, docs=0')
     );
 
+    const emptyKnowledge = await bigModelKnowledgeNode(
+      {
+        messages: [new HumanMessage('Tell me your skills')],
+        retrievedDocs: retrieval.retrievedDocs,
+      } as any,
+      { configurable: { thread_id: 'conv-rag-1' } }
+    );
+    expect(emptyKnowledge.finalMessage).toContain('schedule a call');
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[KnowledgeNode] [conv=conv-rag-1] No retrievedDocs provided')
+    );
+
     vi.spyOn(ChatOpenAI.prototype, 'invoke').mockRejectedValueOnce(
       Object.assign(new Error('Model overloaded'), { status: 429, lc_error_code: 'MODEL_RATE_LIMIT' })
     );
@@ -172,7 +184,7 @@ describe('Node Logging & Failure Diagnostics', () => {
       bigModelKnowledgeNode(
         {
           messages: [new HumanMessage('Tell me your skills')],
-          retrievedDocs: retrieval.retrievedDocs,
+          retrievedDocs: [{ id: 'doc-1', score: 0.9, text: 'TypeScript & Node.js', metadata: {} }],
         } as any,
         { configurable: { thread_id: 'conv-rag-1' } }
       )
@@ -191,7 +203,9 @@ describe('Node Logging & Failure Diagnostics', () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     vi.spyOn(otpService, 'isEmailVerified').mockResolvedValueOnce(false);
+    vi.spyOn(otpService, 'hasDispatchedOtp').mockResolvedValueOnce(false);
     vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValueOnce('hashed');
+    vi.spyOn(otpService, 'markOtpDispatched').mockResolvedValueOnce();
     vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValueOnce('job-99' as any);
 
     vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({

@@ -21,6 +21,7 @@ export const corsOptions: CorsOptions = {
   allowedHeaders: [
     'Content-Type',
     'Authorization',
+    'X-API-Key',
     'Cache-Control',
     'X-Requested-With',
     'Accept',

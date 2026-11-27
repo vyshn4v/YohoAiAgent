@@ -37,6 +37,76 @@ describe('OTP Service', () => {
       redisStore.set(key, String(next));
       return next as any;
     });
+
+    vi.spyOn(redisClient, 'eval').mockImplementation(async (script: any, numKeys: any, ...rest: any[]) => {
+      const s = String(script);
+      const keyCount = Number(numKeys);
+      const keys = rest.slice(0, keyCount).map(String);
+      const args = rest.slice(keyCount).map(String);
+
+      // Simulate Redis single-threaded atomic Lua execution across synchronous store operations
+      if (s.includes("'EXHAUSTED'")) {
+        const [otpKey, attemptsKey, verifiedKey, dispatchedKey, recentlyVerifiedKey] = keys;
+        const maxAttempts = Number(args[0]);
+        const storedHash = redisStore.get(otpKey);
+        if (!storedHash) {
+          return ['MISSING', redisStore.get(recentlyVerifiedKey) || '', '0'] as any;
+        }
+        const attempts = parseInt(redisStore.get(attemptsKey) || '0', 10) + 1;
+        redisStore.set(attemptsKey, String(attempts));
+        if (attempts > maxAttempts) {
+          redisStore.delete(otpKey);
+          redisStore.delete(attemptsKey);
+          redisStore.delete(verifiedKey);
+          redisStore.delete(dispatchedKey);
+          return ['EXHAUSTED', '', String(attempts)] as any;
+        }
+        return ['ACTIVE', storedHash, String(attempts)] as any;
+      }
+
+      if (s.includes("'true'") && keyCount === 5) {
+        const [otpKey, attemptsKey, verifiedKey, dispatchedKey, recentlyVerifiedKey] = keys;
+        const [expectedHash] = args;
+        if (redisStore.get(otpKey) !== expectedHash) {
+          return 0 as any;
+        }
+        redisStore.delete(otpKey);
+        redisStore.delete(attemptsKey);
+        redisStore.delete(dispatchedKey);
+        redisStore.set(verifiedKey, 'true');
+        redisStore.set(recentlyVerifiedKey, expectedHash);
+        return 1 as any;
+      }
+
+      if (keyCount === 4 && s.includes("ARGV[2] == '1'")) {
+        const [otpKey, attemptsKey, verifiedKey, dispatchedKey] = keys;
+        const [expectedHash, clearChallenge] = args;
+        if (redisStore.get(otpKey) !== expectedHash) {
+          return 0 as any;
+        }
+        redisStore.delete(verifiedKey);
+        if (clearChallenge === '1') {
+          redisStore.delete(otpKey);
+          redisStore.delete(attemptsKey);
+          redisStore.delete(dispatchedKey);
+        }
+        return 1 as any;
+      }
+
+      if (keyCount === 3) {
+        const [otpKey, attemptsKey, dispatchedKey] = keys;
+        const [expectedHash] = args;
+        if (redisStore.get(otpKey) === expectedHash) {
+          redisStore.delete(otpKey);
+          redisStore.delete(attemptsKey);
+          redisStore.delete(dispatchedKey);
+          return 3 as any;
+        }
+        return 0 as any;
+      }
+
+      throw new Error(`Unexpected Lua script in otpService.test.ts: ${s}`);
+    });
   });
 
   it('should generate a 6-digit numeric OTP', () => {
@@ -98,6 +168,62 @@ describe('OTP Service', () => {
     expect(result.message).toContain('No active OTP found or it has expired');
   });
 
+  it('allows only one request to redeem the correct OTP when synchronized requests race', async () => {
+    const otp = '778899';
+    await storeHashedOtp(testEmail, otp);
+
+    let gateOpen!: () => void;
+    const startGate = new Promise<void>((resolve) => {
+      gateOpen = resolve;
+    });
+
+    const workers = Array.from({ length: 5 }, async () => {
+      await startGate;
+      return verifyEnteredOtp(testEmail, otp);
+    });
+    gateOpen();
+    const results = await Promise.all(workers);
+
+    const successes = results.filter((r) => r.success);
+    const failures = results.filter((r) => !r.success);
+    expect(successes).toHaveLength(1);
+    expect(failures).toHaveLength(4);
+    expect(redisStore.has(`otp:${testEmail}`)).toBe(false);
+    expect(await isEmailVerified(testEmail)).toBe(true);
+  });
+
+  it('prevents an in-flight valid attempt from succeeding once OTP invalidation occurs', async () => {
+    const otp = '246810';
+    await storeHashedOtp(testEmail, otp);
+
+    const origEval = redisClient.eval.bind(redisClient);
+    let releaseValidConsume!: () => void;
+    const validConsumeGate = new Promise<void>((resolve) => {
+      releaseValidConsume = resolve;
+    });
+    let pauseNextConsume = true;
+
+    vi.spyOn(redisClient, 'eval').mockImplementation(async (...args: any[]) => {
+      const script = String(args[0]);
+      if (pauseNextConsume && script.includes("'true'")) {
+        pauseNextConsume = false;
+        await validConsumeGate;
+      }
+      return origEval(...(args as [any]));
+    });
+
+    const inFlightValid = verifyEnteredOtp(testEmail, otp);
+    for (let i = 0; i < 4; i++) {
+      const bad = await verifyEnteredOtp(testEmail, '000000');
+      expect(bad.success).toBe(false);
+    }
+
+    releaseValidConsume();
+    const res = await inFlightValid;
+    expect(res.success).toBe(false);
+    expect(redisStore.has(`otp:${testEmail}`)).toBe(false);
+  });
+
   it('should invalidate OTP after 5 failed attempts even under parallel verification requests', async () => {
     const otp = '778899';
     await storeHashedOtp(testEmail, otp);
@@ -106,10 +232,17 @@ describe('OTP Service', () => {
       Array.from({ length: 8 }, () => verifyEnteredOtp(testEmail, '000000'))
     );
 
+    expect(parallelResults.every((r) => !r.success)).toBe(true);
     const invalidated = parallelResults.filter((r) =>
       r.message.includes('Too many incorrect attempts')
     );
-    expect(invalidated.length).toBeGreaterThanOrEqual(4);
+    const postInvalidationRejections = parallelResults.filter(
+      (r) =>
+        r.message.includes('Too many incorrect attempts') ||
+        r.message.includes('No active OTP found')
+    );
+    expect(invalidated.length).toBeGreaterThanOrEqual(1);
+    expect(postInvalidationRejections.length).toBeGreaterThanOrEqual(4);
     expect(redisStore.has(`otp:${testEmail}`)).toBe(false);
 
     const lateValidAttempt = await verifyEnteredOtp(testEmail, otp);

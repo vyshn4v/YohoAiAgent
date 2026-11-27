@@ -3,6 +3,7 @@ import { HumanMessage, AIMessage } from '@langchain/core/messages';
 import { agentGraph } from '../src/agent/graph.js';
 import * as otpService from '../src/services/otpService.js';
 import * as emailQueue from '../src/queues/emailQueue.js';
+import * as pgVectorService from '../src/services/pgVectorService.js';
 import { redisClient } from '../src/services/redisClient.js';
 
 describe('LangGraph Agent Multi-Node Orchestration', () => {
@@ -12,6 +13,17 @@ describe('LangGraph Agent Multi-Node Orchestration', () => {
   });
 
   it('should process a profile inquiry through RAG nodes and respond with job details', async () => {
+    vi.spyOn(pgVectorService, 'searchResumeChunks').mockResolvedValueOnce([
+      {
+        id: 'chunk-graph-1',
+        chunkIndex: 0,
+        title: 'Technical Skills & Experience',
+        content: 'Full-Stack & AI Engineer specializing in TypeScript, Node.js, Python, LangGraph, PostgreSQL pgvector, and Redis.',
+        metadata: { source: 'resume.pdf' },
+        similarity: 0.94,
+      },
+    ]);
+
     const result = await agentGraph.invoke({
       messages: [new HumanMessage('What are your main technical skills and experience?')],
     });
@@ -42,6 +54,8 @@ describe('LangGraph Agent Multi-Node Orchestration', () => {
 
   it('should require all details and trigger OTP dispatch when name, email, phone, and reason are given', async () => {
     vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValue('fakehash');
+    vi.spyOn(otpService, 'markOtpDispatched').mockResolvedValue();
+    vi.spyOn(otpService, 'hasDispatchedOtp').mockResolvedValue(false);
     vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValue('job-123' as any);
     vi.spyOn(otpService, 'isEmailVerified').mockResolvedValue(false);
 

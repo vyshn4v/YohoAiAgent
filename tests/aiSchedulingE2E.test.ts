@@ -8,7 +8,8 @@ import { redisClient } from '../src/services/redisClient.js';
 describe('End-to-End AI Multi-Turn Scheduling', () => {
   it('should enforce name requirement, extract phone and reason, verify OTP and book', async () => {
     vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValue('fakehash');
-    vi.spyOn(otpService, 'hasActiveOtp').mockResolvedValue(false);
+    vi.spyOn(otpService, 'markOtpDispatched').mockResolvedValue();
+    vi.spyOn(otpService, 'hasDispatchedOtp').mockResolvedValue(false);
     vi.spyOn(otpService, 'consumeVerifiedEmail').mockResolvedValue();
     vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValue('job-1' as any);
     vi.spyOn(otpService, 'verifyEnteredOtp').mockResolvedValue({

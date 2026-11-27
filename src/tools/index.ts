@@ -5,12 +5,37 @@ import {
   consumeVerifiedEmail,
   generateOtp,
   isEmailVerified,
+  markOtpDispatched,
+  rollbackOtpChallenge,
   storeHashedOtp,
   verifyEnteredOtp,
 } from '../services/otpService.js';
 import { enqueueOtpEmail, enqueueLeadNotification } from '../queues/emailQueue.js';
 import { redisClient } from '../services/redisClient.js';
 import { createNodeLogger } from '../utils/nodeLogger.js';
+
+const MAX_PENDING_CONSUMPTIONS = 500;
+const pendingEnquiryConsumptions = new Map<string, { enquiryId: string; fingerprint: string }>();
+
+function buildEnquiryFingerprint(lead: { name: string; phone: string; reason: string }): string {
+  return `${lead.name.trim()}|${lead.phone.trim()}|${lead.reason.trim()}`;
+}
+
+function trackPendingEnquiryConsumption(
+  normalizedEmail: string,
+  entry: { enquiryId: string; fingerprint: string }
+): void {
+  if (
+    pendingEnquiryConsumptions.size >= MAX_PENDING_CONSUMPTIONS &&
+    !pendingEnquiryConsumptions.has(normalizedEmail)
+  ) {
+    const oldest = pendingEnquiryConsumptions.keys().next();
+    if (!oldest.done) pendingEnquiryConsumptions.delete(oldest.value);
+  } else {
+    pendingEnquiryConsumptions.delete(normalizedEmail);
+  }
+  pendingEnquiryConsumptions.set(normalizedEmail, entry);
+}
 
 /**
  * Tool 1: send_verification_otp
@@ -24,8 +49,17 @@ export const sendVerificationOtpTool = tool(
 
     try {
       const otp = generateOtp();
-      await storeHashedOtp(email, otp);
-      const jobId = await enqueueOtpEmail(email, otp, name);
+      const storedHash = await storeHashedOtp(email, otp);
+
+      let jobId: string | undefined;
+      try {
+        jobId = await enqueueOtpEmail(email, otp, name);
+      } catch (queueError) {
+        await rollbackOtpChallenge(email, storedHash).catch(() => {});
+        throw queueError;
+      }
+
+      await markOtpDispatched(email, storedHash);
 
       log.done({ status: 'sent', jobId });
       return JSON.stringify({
@@ -137,39 +171,59 @@ export const scheduleEnquiryTool = tool(
         });
       }
 
-      // Persist enquiry in Redis
-      const enquiryId = uuidv4();
-      const enquiryData = {
-        id: enquiryId,
-        name: name.trim(),
-        email: email.trim(),
-        phone: phone.trim(),
-        reason: reason.trim(),
-        createdAt: new Date().toISOString(),
-        status: 'confirmed',
-      };
+      const normalizedEmail = email.toLowerCase().trim();
+      const fingerprint = buildEnquiryFingerprint({ name, phone, reason });
+      const pending = pendingEnquiryConsumptions.get(normalizedEmail);
 
-      await redisClient.set(
-        `enquiry:${enquiryId}`,
-        JSON.stringify(enquiryData),
-        'EX',
-        86400 * 30 // Retain for 30 days
-      );
+      let enquiryId: string;
+      if (pending && pending.fingerprint === fingerprint) {
+        // Resume single-use verification consumption without repeating persistence or notification
+        enquiryId = pending.enquiryId;
+      } else {
+        enquiryId = uuidv4();
+        const enquiryData = {
+          id: enquiryId,
+          name: name.trim(),
+          email: email.trim(),
+          phone: phone.trim(),
+          reason: reason.trim(),
+          createdAt: new Date().toISOString(),
+          status: 'confirmed',
+        };
 
-      // Add to enquiries list (bounded to latest 1000 enquiries)
-      await redisClient.lpush('enquiries:list', enquiryId);
-      await redisClient.ltrim('enquiries:list', 0, 999);
+        await redisClient.set(
+          `enquiry:${enquiryId}`,
+          JSON.stringify(enquiryData),
+          'EX',
+          86400 * 30 // Retain for 30 days
+        );
 
-      // Enqueue notification email to host via BullMQ
-      await enqueueLeadNotification({
-        name: enquiryData.name,
-        email: enquiryData.email,
-        phone: enquiryData.phone,
-        reason: enquiryData.reason,
-      });
+        // Add to enquiries list (bounded to latest 1000 enquiries)
+        await redisClient.lpush('enquiries:list', enquiryId);
+        await redisClient.ltrim('enquiries:list', 0, 999);
 
-      // Single-use verification: consume verified flag so future enquiries require a fresh OTP
-      await consumeVerifiedEmail(email);
+        // Enqueue notification email to host via BullMQ
+        await enqueueLeadNotification({
+          name: enquiryData.name,
+          email: enquiryData.email,
+          phone: enquiryData.phone,
+          reason: enquiryData.reason,
+        });
+      }
+
+      // Single-use verification: retain enquiryId across transient consume failures to prevent duplicate bookings
+      try {
+        await consumeVerifiedEmail(email);
+        pendingEnquiryConsumptions.delete(normalizedEmail);
+      } catch (consumeError: any) {
+        trackPendingEnquiryConsumption(normalizedEmail, { enquiryId, fingerprint });
+        log.fail(consumeError, { step: 'consume_verified_email', enquiryId });
+        return JSON.stringify({
+          status: 'error',
+          enquiryId,
+          message: `Failed to finalize verification consumption: ${consumeError.message}`,
+        });
+      }
 
       log.done({ status: 'confirmed', enquiryId });
       return JSON.stringify({
