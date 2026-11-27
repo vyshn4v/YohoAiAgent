@@ -46,21 +46,21 @@ Informs the frontend of the agent's current stage in the RAG pipeline.
 
 ```text
 event: status
-data: {"node":"first_router_and_ui","status":"understanding_query"}
+data: {"node":"decision_router","status":"understanding_query"}
 
 event: status
-data: {"node":"second_extractor","status":"extracting_facts"}
+data: {"node":"pgvector_retriever","status":"extracting_facts"}
 
 event: status
-data: {"node":"third_generator","status":"generating_answer"}
+data: {"node":"knowledge_big_model","status":"generating_answer"}
 ```
 
-**Frontend Action**: Display a subtle status indicator (e.g. *"Yoho is reviewing profile data..."*).
+**Frontend Action**: Display a subtle status indicator (e.g. *"Yoho is searching the knowledge base..."*).
 
 ---
 
 ### Event 2: Token Chunks (`event: token`)
-Delivers words/characters in real time as Google Gemini / LLM produces them.
+Delivers chunks of the completed reply **after** the LangGraph execution finishes (not while Gemini / the LLM is generating). Use `event: status` updates above to show real-time progress during generation.
 
 ```text
 event: token

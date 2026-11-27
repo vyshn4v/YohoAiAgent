@@ -1,21 +1,21 @@
 # AI Agent Backend: Yoho (Vyshnav P C's Portfolio Assistant)
 
-A production-grade, multi-agent AI backend service built with **TypeScript**, **LangGraph.js**, **Google Gemini**, **In-Memory Structured Profile Slicing**, **BullMQ**, and **Redis**.
+A production-grade, multi-agent AI backend service built with **TypeScript**, **LangGraph.js**, **Google Gemini**, **PostgreSQL (`pgvector`)**, **BullMQ**, and **Redis**.
 
-The service powers **Yoho**, the dedicated AI assistant for **[Vyshnav P C](https://portfolio.vyshnavpc.com/)** (Full-Stack & Generative AI Developer based in Kannur, Kerala). It combines a 3-tier LangGraph architecture grounded in verified portfolio facts with an automated meeting/consultation scheduling workflow backed by OTP email verification.
+The service powers **Yoho**, the dedicated AI assistant for **[Vyshnav P C](https://portfolio.vyshnavpc.com/)** (Full-Stack & Generative AI Developer based in Kannur, Kerala). It combines a 4-tier LangGraph RAG pipeline backed by PostgreSQL `pgvector` with an automated meeting/consultation scheduling workflow and OTP email verification.
 
 ---
 
 ## 🌟 Core Capabilities
 
-1. **Multi-Agent Knowledge Assistant (Strictly No Web Search)**:
-   - Answers questions regarding Vyshnav's background, production experience (SDE-I at Neutrinos, Sunlife Philippines, 1,000–2,000 req/min decision engine), flagship systems ([Domain Scanner SaaS](https://domainscanner.vyshnavpc.com), [YohoAiAgent](https://github.com/vyshn4v/YohoAiAgent)), tech stack, and [LixerLab](https://lixerlab.vyshnavpc.com/) agency services.
-   - **Zero-Token In-Memory Profile Slicing**: Slices relevant sections from `src/data/profile.json` in `0ms` with zero token waste.
-   - **Clean Plain-Text Guardrails**: Outputs clean markdown with standard bullet points (`-`), strictly zero HTML tags (`<br>`, `<table>`, etc.), and zero unsolicited tips or conclusions.
-   - Uses a 3-phase orchestration graph:
-     - **Phase 1 (`firstRouterAndUiNode`)**: Classifies intent, extracts contact details and OTP codes, and resolves direct chats in 1 AI call.
-     - **Phase 2 (`secondExtractorNode`)**: Extracts verified facts from sliced `profile.json` data via structured schema.
-     - **Phase 3 (`thirdGeneratorNode`)**: Synthesizes clean, direct answers as **Yoho** with zero hallucination.
+1. **Multi-Agent Knowledge Assistant (Strictly PostgreSQL `pgvector` RAG)**:
+   - Answers questions regarding Vyshnav's background, experience, projects, and tech stack grounded strictly in chunks retrieved from PostgreSQL (`resume_chunks`).
+   - Uses a 4-tier LangGraph workflow ([src/agent/graph.ts](src/agent/graph.ts)):
+     - **`decision_router` (`decisionRouterNode`)**: Classifies intent using `gemini-decision-1` (`greeting`, `schedule_enquiry`, `knowledge_query`, or `out_of_scope` zero-AI cutoff).
+     - **`greeting_small_model` (`greetingSmallModelNode`)**: Instant greeting replies via `gemini-flash-lite-latest` without querying the vector DB.
+     - **`pgvector_retriever` (`pgVectorRetrieverNode`)**: Generates query embeddings (`gemini-embedding-2`) and queries PostgreSQL `pgvector` (`resume_chunks`).
+     - **`knowledge_big_model` (`bigModelKnowledgeNode`)**: Synthesizes concise answers from retrieved chunks via `gemini-3.5-flash-lite`.
+     - **`schedule_enquiry` (`scheduleEnquiryNode`)**: Extracts contact details (`name`, `email`, `phone`, `reason`, `otp`) and runs OTP verification / booking tools.
 
 2. **Autonomous Meeting & Consultation Booking with OTP Verification**:
    - Enables prospective clients, recruiters, and collaborators to book consultations directly through the chat.
@@ -40,30 +40,25 @@ The service powers **Yoho**, the dedicated AI assistant for **[Vyshnav P C](http
                       |   User /api/chat Request   |
                       +--------------+--------------+
                                      |
-                     [Phase 1: firstRouterAndUiNode]
+                     [Node 1: decision_router (gemini-decision-1)]
                                      |
-               +---------------------+---------------------+
-               |                                           |
-    [Intent: profile_query]                     [Intent: direct / schedule / greeting]
-               |                                           |
-+------------------------------+             +------------------------------+
-| In-Memory Slicing            |             | Direct AI Response / Booking |
-| (src/data/profile.json)      |             | 1. send_verification_otp     |
-+--------------+---------------+             |    -> SHA-256 hash in Redis  |
-               |                             |    -> Enqueue BullMQ mail job|
-+------------------------------+             | 2. verify_otp                |
-| Phase 2: Fact Extractor      |             |    -> Constant-time compare  |
-| (Structured JSON facts)      |             |    -> Set verified in Redis  |
-+--------------+---------------+             | 3. schedule_enquiry          |
-               |                             |    -> Require verified email |
-+------------------------------+             |    -> Promise 24h SLA        |
-| Phase 3: Response Synthesizer|             +--------------+---------------+
-| (Clean plain text, no HTML)  |                            |
-+--------------+---------------+                            |
-               |                                            |
-               +---------------------+----------------------+
-                                     |
-                                [Response]
+         +---------------------------+---------------------------+
+         |                           |                           |
+ [knowledge_query]           [greeting / out_of_scope]    [schedule_enquiry]
+         |                           |                           |
++------------------------+   +--------------------+   +----------------------------+
+| pgvector_retriever     |   | Greeting / Cutoff  |   | 1. send_verification_otp   |
+| (PostgreSQL pgvector)  |   +---------+----------+   |    -> SHA-256 hash in Redis|
++-----------+------------+             |              |    -> Enqueue BullMQ job   |
+            |                          |              | 2. verify_otp              |
++------------------------+             |              | 3. schedule_enquiry        |
+| knowledge_big_model    |             |              |    -> Require verified     |
+| (gemini-3.5-flash-lite)|             |              |    -> Promise 24h SLA      |
++-----------+------------+             |              +-------------+--------------+
+            |                          |                            |
+            +--------------------------+----------------------------+
+                                       |
+                                  [Response]
 ```
 
 ---
@@ -72,29 +67,31 @@ The service powers **Yoho**, the dedicated AI assistant for **[Vyshnav P C](http
 
 ```
 AiAgent/
-├── data/
-│   └── profile.json             # Synchronized profile database
+├── data/                        # Resume PDF source for ingestion (data/resume.pdf)
 ├── src/
 │   ├── agent/                   # LangGraph multi-agent state machine & nodes
+│   │   ├── llm/modelFactory.ts  # Gemini & OpenAI-compatible model factory
+│   │   ├── nodes/               # Per-node modules (decisionRouter, greeting, pgVectorRetriever, knowledge, scheduleEnquiry)
+│   │   ├── utils/messageUtils.ts# Shared message & LangSmith helpers
 │   │   ├── graph.ts             # StateGraph definition & conditional edges
-│   │   ├── nodes.ts             # 3-Phase agent nodes (Router, Extractor, Generator)
+│   │   ├── nodes.ts             # Node barrel re-exports
 │   │   └── state.ts             # LangGraph state annotations & Lead schema
-│   ├── config/                  # Multi-provider environment configuration (Gemini, Groq, NVIDIA, OpenRouter)
-│   ├── data/
-│   │   └── profile.json         # Ground-truth structured portfolio database
+│   ├── config/                  # Multi-provider environment & pgvector configuration
 │   ├── docs/                    # OpenAPI / Swagger specification
+│   ├── http/                    # Express routers, CORS, SSE streamer & session store
 │   ├── queues/                  # BullMQ email queue producer & connection setup
 │   ├── scripts/
 │   │   ├── cliChat.ts           # Interactive terminal CLI chat for testing
-│   │   └── ingest.ts            # Optional Pinecone vector ingestion script
+│   │   └── ingestResumePdf.ts   # Resume PDF -> PostgreSQL pgvector ingestion script
 │   ├── services/
-│   │   ├── emailService.ts      # Nodemailer SMTP transporter & templates
+│   │   ├── embeddingService.ts  # Gemini vector embeddings & deterministic test fallback
 │   │   ├── otpService.ts        # OTP generation, Redis crypto storage, and verification
-│   │   ├── profileLoader.ts     # In-memory category slicer and typed JSON loader
-│   │   └── pineconeService.ts   # Optional vector search service
+│   │   ├── pgVectorService.ts   # PostgreSQL pgvector table, replace & cosine search
+│   │   └── redisClient.ts       # Redis client singleton
 │   ├── tools/                   # AI tool definitions (OTP & Scheduling)
-│   ├── workers/                 # BullMQ background consumer worker
-│   └── server.ts                # Express REST API, CORS, SSE streaming & Swagger UI
+│   ├── utils/                   # Structured node logger
+│   ├── workers/                 # BullMQ background email consumer & templates
+│   └── server.ts                # Express server entrypoint
 ├── docs/
 │   ├── ARCHITECTURE.md          # Comprehensive architecture specification
 │   └── FRONTEND_INTEGRATION_GUIDE.md # Frontend SSE integration & widgets
@@ -109,6 +106,7 @@ AiAgent/
 
 ### 1. Prerequisites
 - **Node.js**: v18+ (tested on Node v20/v26)
+- **PostgreSQL + `pgvector`**: PostgreSQL database with `vector` extension enabled (`DATABASE_URL`).
 - **Redis**: Local Redis (`redis-server`), WSL2, Docker, or managed cloud Redis.
 - **Google Gemini API Key**: Free tier API key from [Google AI Studio](https://aistudio.google.com/).
 
@@ -125,21 +123,20 @@ Key environment variables:
 | `LLM_PROVIDER` | Active LLM provider (`gemini`, `groq`, `nvidia`, `openrouter`) | `gemini` |
 | `GEMINI_API_KEY` | Google AI Studio API key | (Required) |
 | `GEMINI_BASE_URL` | OpenAI-compatible endpoint | `https://generativelanguage.googleapis.com/v1beta/openai/` |
-| `GEMINI_MODEL` | Active model identifier | `gemini-flash-lite-latest` |
+| `GEMINI_MODEL` | Active model identifier | `gemini-flash-latest` |
+| `DATABASE_URL` | PostgreSQL connection URL for `pgvector` | `postgresql://postgres:postgres@localhost:5432/portfolio_db` |
 | `REDIS_HOST`, `REDIS_PORT` | Connection host and port for Redis | `localhost`, `6379` |
 | `REDIS_PASSWORD` | Redis password (leave empty if none) | `""` |
 | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS` | SMTP credentials for sending verification emails | — |
 | `HOST_EMAIL` | Destination inbox for verified lead notifications (users should configure a valid destination for notifications) | `vyshnav@example.com` |
+| `ADMIN_API_KEY` | API key required via `x-api-key` or `Bearer` token for `/api/ingest` and `/api/enquiries` | `""` |
 | `CORS_ORIGIN` | Allowed CORS origins | `*` |
 
-### 3. Ground Truth Profile Database (`src/data/profile.json`)
-All facts are centralized in `src/data/profile.json`:
-- **Identity & Bio:** SDE-I, full-stack, distributed systems, and agentic AI.
-- **Experience:** Neutrinos (Sunlife Philippines enterprise project, 1,000–2,000 req/min decision engine).
-- **Flagship Projects:** [Domain Scanner SaaS](https://domainscanner.vyshnavpc.com) and [YohoAiAgent](https://github.com/vyshn4v/YohoAiAgent).
-- **Agency Initiative:** [LixerLab](https://lixerlab.vyshnavpc.com/).
-- **Certifications & Education:** AWS Solutions Architect, Meta, Udemy, Akshay Saini verified courses, Brototype Bootcamp.
-- **Scheduling Policy:** 24h follow-up guarantee, OTP requirements, and contact validation.
+### 3. Indexing Resume Knowledge (`pgvector`)
+Place a resume PDF at `data/resume.pdf` (or set `RESUME_PDF_PATH`) and index chunks into PostgreSQL `resume_chunks`:
+```bash
+npm run ingest:pdf
+```
 
 ### 4. Running the Development Server
 ```bash
@@ -168,7 +165,7 @@ npm test
 
 ## 🛡️ Guardrails & Formatting Rules
 
-1. **Strictly Grounded (No Web Search)**: Yoho answers queries strictly from the verified facts in `src/data/profile.json`.
+1. **Strictly Grounded (No Web Search)**: Yoho answers portfolio questions from chunks retrieved from PostgreSQL `pgvector` (`resume_chunks`) and cuts off unrelated queries in `decision_router`.
 2. **Pure Plain Text (No HTML)**: The prompt strictly forbids HTML tags (`<br>`, `<table>`, `<tr>`, `<td>`, `<p>`, `<div>`). Output is rendered as standard markdown bullets (`-`).
 3. **No Unsolicited Wrap-Ups**: Concluding summaries, commentary, and tips (e.g. `"💡 Tip:"`, `"✨ Summary:"`) are completely suppressed.
 4. **24-Hour SLA Commitment**: All booking and consultation flows commit to a personal response from Vyshnav within 24 hours.

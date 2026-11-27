@@ -1,14 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ChatOpenAI } from '@langchain/openai';
 import {
+  bigModelKnowledgeNode,
   decisionRouterNode,
   getGoogleGenAiClient,
   greetingSmallModelNode,
   pgVectorRetrieverNode,
+  scheduleEnquiryNode,
 } from '../src/agent/nodes.js';
+import { extractOtpFromLastMessage } from '../src/agent/nodes/scheduleEnquiryNode.js';
 import { agentGraph } from '../src/agent/graph.js';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import * as pgVectorService from '../src/services/pgVectorService.js';
+import * as otpService from '../src/services/otpService.js';
+import * as emailQueue from '../src/queues/emailQueue.js';
 
 describe('Decision AI & 4-Tier Model Routing', () => {
   beforeEach(() => {
@@ -42,7 +47,7 @@ describe('Decision AI & 4-Tier Model Routing', () => {
           id: 'chunk-1',
           chunkIndex: 0,
           title: 'Technical Skills',
-          content: 'LangGraph, TypeScript, Node.js, Python, Pinecone, BullMQ',
+          content: 'LangGraph, TypeScript, Node.js, Python, PostgreSQL pgvector, BullMQ',
           metadata: { page: 1 },
           similarity: 0.92,
         },
@@ -61,7 +66,7 @@ describe('Decision AI & 4-Tier Model Routing', () => {
       expect(result.retrievedDocs![0].text).toContain('LangGraph');
     });
 
-    it('should fall back gracefully to local profile sections when pgvector is empty', async () => {
+    it('should handle empty pgvector results gracefully without crashing', async () => {
       vi.spyOn(pgVectorService, 'searchResumeChunks').mockResolvedValue([]);
 
       const state = {
@@ -71,8 +76,52 @@ describe('Decision AI & 4-Tier Model Routing', () => {
 
       const result = await pgVectorRetrieverNode(state as any);
 
-      expect(result.retrievedDocs).toBeDefined();
-      expect(result.retrievedDocs!.length).toBeGreaterThan(0);
+      expect(result.retrievedDocs).toEqual([]);
+    });
+
+    it('should return empty docs cleanly when pgvector search throws an error', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(pgVectorService, 'searchResumeChunks').mockRejectedValueOnce(
+        new Error('DB connection lost')
+      );
+
+      const state = {
+        messages: [new HumanMessage('Tell me about Neutrinos')],
+        extractedKeywords: 'Neutrinos experience',
+      };
+
+      const result = await pgVectorRetrieverNode(state as any);
+
+      expect(result.retrievedDocs).toEqual([]);
+    });
+
+    it('returns an insufficient-context reply offering a call without hardcoded bio or LLM invocation when retrievedDocs is empty', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const llmSpy = vi.spyOn(ChatOpenAI.prototype, 'invoke');
+
+      const result = await bigModelKnowledgeNode({
+        messages: [new HumanMessage('Where did you study?')],
+        retrievedDocs: [],
+      } as any);
+
+      expect(llmSpy).not.toHaveBeenCalled();
+      expect(result.finalMessage).toContain("don't have enough verified information");
+      expect(result.finalMessage).toContain('schedule a call');
+      expect(result.uiAction).toBeNull();
+    });
+
+    it('preserves answers grounded in retrievedDocs when chunks are available', async () => {
+      const llmSpy = vi
+        .spyOn(ChatOpenAI.prototype, 'invoke')
+        .mockResolvedValueOnce(new AIMessage('Grounded in chunk content.') as any);
+
+      const result = await bigModelKnowledgeNode({
+        messages: [new HumanMessage('What frameworks do you use?')],
+        retrievedDocs: [{ id: '1', score: 0.9, text: '### Skills\nLangGraph & TypeScript', metadata: {} }],
+      } as any);
+
+      expect(llmSpy).toHaveBeenCalledTimes(1);
+      expect(result.finalMessage).toBe('Grounded in chunk content.');
     });
   });
 
@@ -153,6 +202,195 @@ describe('Decision AI & 4-Tier Model Routing', () => {
           input: expect.stringContaining('Latest user message: "Vyshnav"'),
         })
       );
+    });
+  });
+
+  describe('scheduleEnquiryNode OTP & email state edge cases', () => {
+    it('asks for email instead of falling back to user@example.com when OTP has no email', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const verifySpy = vi.spyOn(otpService, 'verifyEnteredOtp');
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alex',
+          email: null,
+          phone: null,
+          reason: null,
+          otp: '654321',
+          action: 'verify_otp',
+        }),
+      } as any);
+
+      const result = await scheduleEnquiryNode({
+        messages: [new HumanMessage('654321')],
+        leadInfo: { name: 'Alex' },
+        isVerified: false,
+      } as any);
+
+      expect(verifySpy).not.toHaveBeenCalled();
+      expect(String(result.messages![0].content)).toContain('email address');
+    });
+
+    it('resets isVerified on email change and verifies subsequent OTP regardless of action label', async () => {
+      vi.spyOn(otpService, 'isEmailVerified').mockResolvedValueOnce(false);
+      vi.spyOn(otpService, 'hasDispatchedOtp').mockResolvedValueOnce(false);
+      vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValueOnce('hashed');
+      vi.spyOn(otpService, 'markOtpDispatched').mockResolvedValueOnce();
+      vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValueOnce('job-bob' as any);
+
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alice',
+          email: 'bob@example.com',
+          phone: '+1 555-0100',
+          reason: 'Consultation',
+          otp: null,
+          action: 'send_otp',
+        }),
+      } as any);
+
+      const dispatchRes = await scheduleEnquiryNode({
+        messages: [new HumanMessage('Use bob@example.com instead, phone +1 555-0100 for consultation')],
+        leadInfo: { name: 'Alice', email: 'alice@example.com' },
+        isVerified: true,
+      } as any);
+
+      expect(dispatchRes.isVerified).toBe(false);
+
+      const verifySpy = vi.spyOn(otpService, 'verifyEnteredOtp').mockResolvedValueOnce({
+        success: false,
+        message: 'Invalid code.',
+      });
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alice',
+          email: 'bob@example.com',
+          phone: '+1 555-0100',
+          reason: 'Consultation',
+          otp: '456789',
+          action: 'schedule',
+        }),
+      } as any);
+
+      await scheduleEnquiryNode({
+        messages: [new HumanMessage('456789')],
+        leadInfo: { name: 'Alice', email: 'bob@example.com', phone: '+1 555-0100', reason: 'Consultation' },
+        isVerified: Boolean(dispatchRes.isVerified),
+      } as any);
+
+      expect(verifySpy).toHaveBeenCalledWith('bob@example.com', '456789');
+    });
+
+    it('requires phone and reason before dispatching an OTP or scheduling', async () => {
+      const otpSpy = vi.spyOn(otpService, 'storeHashedOtp');
+      const leadSpy = vi.spyOn(emailQueue, 'enqueueLeadNotification');
+
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alice',
+          email: 'alice@example.com',
+          phone: null,
+          reason: null,
+          otp: null,
+          action: 'schedule',
+        }),
+      } as any);
+
+      const res = await scheduleEnquiryNode({
+        messages: [new HumanMessage('My name is Alice and email is alice@example.com')],
+        leadInfo: {},
+        isVerified: false,
+      } as any);
+
+      const reply = String(res.messages![0].content).toLowerCase();
+      expect(reply).toContain('phone number');
+      expect(reply).toContain('reason for connecting');
+      expect(otpSpy).not.toHaveBeenCalled();
+      expect(leadSpy).not.toHaveBeenCalled();
+    });
+
+    it('extracts OTP deterministically from latest message even if AI omits it and ignores stale history OTPs', async () => {
+      expect(extractOtpFromLastMessage('654321', false)).toBe('654321');
+      expect(extractOtpFromLastMessage('Here is my otp: 654321', false)).toBe('654321');
+      expect(extractOtpFromLastMessage('+91 9876543210', true)).toBeNull();
+
+      const verifySpy = vi.spyOn(otpService, 'verifyEnteredOtp').mockResolvedValueOnce({
+        success: false,
+        message: 'Invalid code.',
+      });
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alice',
+          email: 'alice@example.com',
+          phone: '+1 555-0100',
+          reason: 'Project chat',
+          otp: null, // Simulate LLM failing to extract bare OTP
+          action: 'schedule',
+        }),
+      } as any);
+
+      const res = await scheduleEnquiryNode({
+        messages: [
+          new AIMessage('A 6-digit verification code has been dispatched to alice@example.com.'),
+          new HumanMessage('654321'),
+        ],
+        leadInfo: {
+          name: 'Alice',
+          email: 'alice@example.com',
+          phone: '+1 555-0100',
+          reason: 'Project chat',
+        },
+        isVerified: false,
+      } as any);
+
+      expect(verifySpy).toHaveBeenCalledWith('alice@example.com', '654321');
+      expect(res.isVerified).toBe(false);
+    });
+
+    it('retries OTP dispatch when an active hash was not dispatched, but reuses after successful dispatch', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(otpService, 'isEmailVerified').mockResolvedValue(false);
+
+      const activeMock = vi.spyOn(otpService, 'hasActiveOtp').mockResolvedValue(true);
+      const dispatchedMock = vi
+        .spyOn(otpService, 'hasDispatchedOtp')
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(true);
+      vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValueOnce('hashed-retry');
+      const enqueueSpy = vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValueOnce('job-retry' as any);
+      const markDispatchedSpy = vi.spyOn(otpService, 'markOtpDispatched').mockResolvedValueOnce();
+
+      vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValue({
+        invoke: vi.fn().mockResolvedValue({
+          name: 'Alice',
+          email: 'alice@example.com',
+          phone: '+1 555-0100',
+          reason: 'Consultation',
+          otp: null,
+          action: 'schedule',
+        }),
+      } as any);
+
+      const baseState = {
+        messages: [new HumanMessage('Proceed with scheduling')],
+        leadInfo: {
+          name: 'Alice',
+          email: 'alice@example.com',
+          phone: '+1 555-0100',
+          reason: 'Consultation',
+        },
+        isVerified: false,
+      } as any;
+
+      const retryRes = await scheduleEnquiryNode(baseState);
+      expect(enqueueSpy).toHaveBeenCalledTimes(1);
+      expect(markDispatchedSpy).toHaveBeenCalledWith('alice@example.com', 'hashed-retry');
+      expect(String(retryRes.messages![0].content)).toContain('dispatched to alice@example.com');
+
+      const reuseRes = await scheduleEnquiryNode(baseState);
+      expect(dispatchedMock).toHaveBeenCalledTimes(2);
+      expect(enqueueSpy).toHaveBeenCalledTimes(1);
+      expect(String(reuseRes.messages![0].content)).toContain('already sent');
+      expect(activeMock).not.toHaveBeenCalled();
     });
   });
 });

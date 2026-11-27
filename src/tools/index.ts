@@ -2,15 +2,40 @@ import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import {
+  consumeVerifiedEmail,
   generateOtp,
+  isEmailVerified,
+  markOtpDispatched,
+  rollbackOtpChallenge,
   storeHashedOtp,
   verifyEnteredOtp,
-  isEmailVerified,
 } from '../services/otpService.js';
 import { enqueueOtpEmail, enqueueLeadNotification } from '../queues/emailQueue.js';
-import { queryPinecone } from '../services/pineconeService.js';
 import { redisClient } from '../services/redisClient.js';
 import { createNodeLogger } from '../utils/nodeLogger.js';
+
+const MAX_PENDING_CONSUMPTIONS = 500;
+const pendingEnquiryConsumptions = new Map<string, { enquiryId: string; fingerprint: string }>();
+
+function buildEnquiryFingerprint(lead: { name: string; phone: string; reason: string }): string {
+  return `${lead.name.trim()}|${lead.phone.trim()}|${lead.reason.trim()}`;
+}
+
+function trackPendingEnquiryConsumption(
+  normalizedEmail: string,
+  entry: { enquiryId: string; fingerprint: string }
+): void {
+  if (
+    pendingEnquiryConsumptions.size >= MAX_PENDING_CONSUMPTIONS &&
+    !pendingEnquiryConsumptions.has(normalizedEmail)
+  ) {
+    const oldest = pendingEnquiryConsumptions.keys().next();
+    if (!oldest.done) pendingEnquiryConsumptions.delete(oldest.value);
+  } else {
+    pendingEnquiryConsumptions.delete(normalizedEmail);
+  }
+  pendingEnquiryConsumptions.set(normalizedEmail, entry);
+}
 
 /**
  * Tool 1: send_verification_otp
@@ -24,8 +49,17 @@ export const sendVerificationOtpTool = tool(
 
     try {
       const otp = generateOtp();
-      await storeHashedOtp(email, otp);
-      const jobId = await enqueueOtpEmail(email, otp, name);
+      const storedHash = await storeHashedOtp(email, otp);
+
+      let jobId: string | undefined;
+      try {
+        jobId = await enqueueOtpEmail(email, otp, name);
+      } catch (queueError) {
+        await rollbackOtpChallenge(email, storedHash).catch(() => {});
+        throw queueError;
+      }
+
+      await markOtpDispatched(email, storedHash);
 
       log.done({ status: 'sent', jobId });
       return JSON.stringify({
@@ -120,6 +154,14 @@ export const scheduleEnquiryTool = tool(
     log.start({ hasName: Boolean(name), hasPhone: Boolean(phone), reasonLen: reason.length });
 
     try {
+      if (!name?.trim() || !email?.trim() || !phone?.trim() || !reason?.trim()) {
+        log.warn('Blocked enquiry scheduling due to missing required details');
+        return JSON.stringify({
+          status: 'missing_fields',
+          message: 'All details (name, email, phone, and reason) are required to schedule an enquiry.',
+        });
+      }
+
       const verified = await isEmailVerified(email);
       if (!verified) {
         log.done({ status: 'unverified' });
@@ -129,30 +171,59 @@ export const scheduleEnquiryTool = tool(
         });
       }
 
-      // Persist enquiry in Redis
-      const enquiryId = uuidv4();
-      const enquiryData = {
-        id: enquiryId,
-        name,
-        email,
-        phone,
-        reason,
-        createdAt: new Date().toISOString(),
-        status: 'confirmed',
-      };
+      const normalizedEmail = email.toLowerCase().trim();
+      const fingerprint = buildEnquiryFingerprint({ name, phone, reason });
+      const pending = pendingEnquiryConsumptions.get(normalizedEmail);
 
-      await redisClient.set(
-        `enquiry:${enquiryId}`,
-        JSON.stringify(enquiryData),
-        'EX',
-        86400 * 30 // Retain for 30 days
-      );
+      let enquiryId: string;
+      if (pending && pending.fingerprint === fingerprint) {
+        // Resume single-use verification consumption without repeating persistence or notification
+        enquiryId = pending.enquiryId;
+      } else {
+        enquiryId = uuidv4();
+        const enquiryData = {
+          id: enquiryId,
+          name: name.trim(),
+          email: email.trim(),
+          phone: phone.trim(),
+          reason: reason.trim(),
+          createdAt: new Date().toISOString(),
+          status: 'confirmed',
+        };
 
-      // Add to enquiries list
-      await redisClient.lpush('enquiries:list', enquiryId);
+        await redisClient.set(
+          `enquiry:${enquiryId}`,
+          JSON.stringify(enquiryData),
+          'EX',
+          86400 * 30 // Retain for 30 days
+        );
 
-      // Enqueue notification email to host via BullMQ
-      await enqueueLeadNotification({ name, email, phone, reason });
+        // Add to enquiries list (bounded to latest 1000 enquiries)
+        await redisClient.lpush('enquiries:list', enquiryId);
+        await redisClient.ltrim('enquiries:list', 0, 999);
+
+        // Enqueue notification email to host via BullMQ
+        await enqueueLeadNotification({
+          name: enquiryData.name,
+          email: enquiryData.email,
+          phone: enquiryData.phone,
+          reason: enquiryData.reason,
+        });
+      }
+
+      // Single-use verification: retain enquiryId across transient consume failures to prevent duplicate bookings
+      try {
+        await consumeVerifiedEmail(email);
+        pendingEnquiryConsumptions.delete(normalizedEmail);
+      } catch (consumeError: any) {
+        trackPendingEnquiryConsumption(normalizedEmail, { enquiryId, fingerprint });
+        log.fail(consumeError, { step: 'consume_verified_email', enquiryId });
+        return JSON.stringify({
+          status: 'error',
+          enquiryId,
+          message: `Failed to finalize verification consumption: ${consumeError.message}`,
+        });
+      }
 
       log.done({ status: 'confirmed', enquiryId });
       return JSON.stringify({
@@ -182,39 +253,8 @@ export const scheduleEnquiryTool = tool(
   }
 );
 
-/**
- * Tool 4: search_pinecone
- * Vector search retrieval tool for profile, skills, experience, and services.
- */
-export const searchPineconeTool = tool(
-  async ({ query }) => {
-    const log = createNodeLogger('Tool:search_pinecone');
-    log.start({ queryLen: query.length });
-
-    try {
-      const docs = await queryPinecone(query, 4);
-      log.done({ docs: docs.length });
-      return JSON.stringify(docs);
-    } catch (error: any) {
-      log.fail(error);
-      return JSON.stringify({
-        error: `Search error: ${error.message}`,
-      });
-    }
-  },
-  {
-    name: 'search_pinecone',
-    description:
-      'Searches the Pinecone knowledge base for Vyshnav P C’s job details, technical skills, projects, experience, and contact policies.',
-    schema: z.object({
-      query: z.string().describe('The search query or keywords to look up in the profile.'),
-    }),
-  }
-);
-
 export const agentTools = [
   sendVerificationOtpTool,
   verifyOtpTool,
   scheduleEnquiryTool,
-  searchPineconeTool,
 ];

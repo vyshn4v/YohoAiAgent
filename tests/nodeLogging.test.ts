@@ -10,7 +10,6 @@ import {
   scheduleEnquiryNode,
 } from '../src/agent/nodes.js';
 import * as pgVectorService from '../src/services/pgVectorService.js';
-import * as profileLoader from '../src/services/profileLoader.js';
 import * as otpService from '../src/services/otpService.js';
 import * as emailQueue from '../src/queues/emailQueue.js';
 import {
@@ -142,15 +141,12 @@ describe('Node Logging & Failure Diagnostics', () => {
     );
   });
 
-  it('logs PgVectorRetriever fallback and KnowledgeNode execution/failure', async () => {
+  it('logs PgVectorRetriever empty results and KnowledgeNode execution/failure', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     vi.spyOn(pgVectorService, 'searchResumeChunks').mockResolvedValueOnce([]);
-    vi.spyOn(profileLoader, 'loadProfileSections').mockReturnValueOnce([
-      { id: 'sec-1', title: 'Skills', text: 'TypeScript and LangGraph', metadata: {} },
-    ]);
 
     const retrieval = await pgVectorRetrieverNode(
       {
@@ -160,11 +156,24 @@ describe('Node Logging & Failure Diagnostics', () => {
       { configurable: { thread_id: 'conv-rag-1' } }
     );
 
+    expect(retrieval.retrievedDocs).toEqual([]);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('[PgVectorRetriever] [conv=conv-rag-1] pgvector returned 0 chunks')
     );
     expect(logSpy).toHaveBeenCalledWith(
-      expect.stringContaining('source=local_fallback, docs=1')
+      expect.stringContaining('source=empty, docs=0')
+    );
+
+    const emptyKnowledge = await bigModelKnowledgeNode(
+      {
+        messages: [new HumanMessage('Tell me your skills')],
+        retrievedDocs: retrieval.retrievedDocs,
+      } as any,
+      { configurable: { thread_id: 'conv-rag-1' } }
+    );
+    expect(emptyKnowledge.finalMessage).toContain('schedule a call');
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[KnowledgeNode] [conv=conv-rag-1] No retrievedDocs provided')
     );
 
     vi.spyOn(ChatOpenAI.prototype, 'invoke').mockRejectedValueOnce(
@@ -175,7 +184,7 @@ describe('Node Logging & Failure Diagnostics', () => {
       bigModelKnowledgeNode(
         {
           messages: [new HumanMessage('Tell me your skills')],
-          retrievedDocs: retrieval.retrievedDocs,
+          retrievedDocs: [{ id: 'doc-1', score: 0.9, text: 'TypeScript & Node.js', metadata: {} }],
         } as any,
         { configurable: { thread_id: 'conv-rag-1' } }
       )
@@ -194,7 +203,9 @@ describe('Node Logging & Failure Diagnostics', () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     vi.spyOn(otpService, 'isEmailVerified').mockResolvedValueOnce(false);
+    vi.spyOn(otpService, 'hasDispatchedOtp').mockResolvedValueOnce(false);
     vi.spyOn(otpService, 'storeHashedOtp').mockResolvedValueOnce('hashed');
+    vi.spyOn(otpService, 'markOtpDispatched').mockResolvedValueOnce();
     vi.spyOn(emailQueue, 'enqueueOtpEmail').mockResolvedValueOnce('job-99' as any);
 
     vi.spyOn(ChatOpenAI.prototype, 'withStructuredOutput').mockReturnValueOnce({
